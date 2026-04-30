@@ -216,7 +216,7 @@ class VLLMProtocol:
             # Standard TP mode: one process per node
             return endpoints_to_processes(endpoints, base_sys_port=base_sys_port)
 
-        # DP+EP mode: one process per GPU
+        # DP mode: one process per DP rank
         processes: list[Process] = []
         current_sys_port = base_sys_port
         port_allocator = NodePortAllocator()
@@ -372,11 +372,11 @@ class VLLMProtocol:
             kv_transfer_cfg = _connector_to_kv_transfer_config(connector)
             cmd.extend(["--kv-transfer-config", kv_transfer_cfg])
 
-        # Check if this is DP+EP mode (data-parallel-size set)
+        # Check if this is DP mode (data-parallel-size set)
         is_dp_mode = self._is_dp_mode(mode)
 
         if is_dp_mode:
-            # DP+EP mode: each GPU runs its own process
+            # DP mode: each process represents one DP rank and may see multiple TP GPUs.
             # process.node_rank is the dp_rank (set in endpoints_to_processes)
             dp_rank = process.node_rank
             dp_rpc_port = config.pop("data-parallel-rpc-port", None) or config.pop("data_parallel_rpc_port", 13345)
