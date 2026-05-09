@@ -36,18 +36,18 @@ from ._sglang_encoding_dsv4 import encode_messages as _encode_messages
 
 
 def _env_enable_thinking() -> bool:
-    """Parse ``SGLANG_ENABLE_THINKING`` the same way sglang ``EnvBool`` does."""
-    return os.environ.get("SGLANG_ENABLE_THINKING", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
+    """Parse ``SGLANG_DEFAULT_THINKING`` (with the deprecated ``SGLANG_ENABLE_THINKING`` as fallback) the way sglang ``EnvBool`` does."""
+    val = os.environ.get(
+        "SGLANG_DEFAULT_THINKING", os.environ.get("SGLANG_ENABLE_THINKING", "")
     )
+    return val.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _env_reasoning_effort() -> Optional[str]:
-    """Parse ``SGLANG_REASONING_EFFORT``; only ``max`` / ``high`` are honored."""
-    val = os.environ.get("SGLANG_REASONING_EFFORT", "").strip()
+    """Parse ``SGLANG_DSV4_REASONING_EFFORT`` (with the deprecated ``SGLANG_REASONING_EFFORT`` as fallback); only ``max`` / ``high`` are honored."""
+    val = os.environ.get(
+        "SGLANG_DSV4_REASONING_EFFORT", os.environ.get("SGLANG_REASONING_EFFORT", "")
+    ).strip()
     return val if val in ("max", "high") else None
 
 
