@@ -36,18 +36,18 @@ from ._sglang_encoding_dsv4 import encode_messages as _encode_messages
 
 
 def _env_enable_thinking() -> bool:
-    """Parse ``SGLANG_ENABLE_THINKING`` the same way sglang ``EnvBool`` does."""
-    return os.environ.get("SGLANG_ENABLE_THINKING", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
+    """Parse ``SGLANG_DEFAULT_THINKING`` (with the deprecated ``SGLANG_ENABLE_THINKING`` as fallback) the way sglang ``EnvBool`` does."""
+    val = os.environ.get(
+        "SGLANG_DEFAULT_THINKING", os.environ.get("SGLANG_ENABLE_THINKING", "")
     )
+    return val.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _env_reasoning_effort() -> Optional[str]:
-    """Parse ``SGLANG_REASONING_EFFORT``; only ``max`` / ``high`` are honored."""
-    val = os.environ.get("SGLANG_REASONING_EFFORT", "").strip()
+    """Parse ``SGLANG_DSV4_REASONING_EFFORT`` (with the deprecated ``SGLANG_REASONING_EFFORT`` as fallback); only ``max`` / ``high`` are honored."""
+    val = os.environ.get(
+        "SGLANG_DSV4_REASONING_EFFORT", os.environ.get("SGLANG_REASONING_EFFORT", "")
+    ).strip()
     return val if val in ("max", "high") else None
 
 
@@ -87,6 +87,25 @@ class SGLangDeepseekV4Tokenizer:
 
     def __init__(self, hf_tokenizer):
         self._hf = hf_tokenizer
+
+    def __call__(self, *args, **kwargs):
+        # sa-bench's calculate_metrics (benchmark_serving.py) calls
+        # ``tokenizer(text, add_special_tokens=False)`` to count generated
+        # tokens. Without this delegation the wrapper isn't callable and
+        # the benchmark fails with ``TypeError: 'SGLangDeepseekV4Tokenizer'
+        # object is not callable``. Mirrors what vllm_deepseek_v4.py
+        # achieves by returning the HF subclass directly.
+        return self._hf(*args, **kwargs)
+
+    def __getattr__(self, name):
+        # Proxy any non-overridden attribute (``encode``, ``pad_token``,
+        # etc.) through to the wrapped HF tokenizer so downstream callers
+        # that expect a full ``PreTrainedTokenizerFast`` API work without
+        # knowing about this wrapper. ``apply_chat_template`` is defined
+        # below and wins via normal attribute lookup before ``__getattr__``.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._hf, name)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
