@@ -5,7 +5,12 @@
 
 import pytest
 
-from srtctl.core.topology import allocate_endpoints, endpoints_to_processes
+from srtctl.core.topology import (
+    NodePortAllocator,
+    allocate_endpoints,
+    compute_port_jitter,
+    endpoints_to_processes,
+)
 
 
 class TestAllocateEndpoints:
@@ -373,3 +378,112 @@ class TestEndpointsToProcesses:
         assert len(nixl_ports) == len(set(nixl_ports))  # All unique
         assert min(nixl_ports) == 6550  # Starts at base
         assert nixl_ports == [6550, 6551]  # Sequential
+
+
+class TestPortJitter:
+    """Tests for per-job port jitter that WARs the SGLang ZMQ rpc_port collision."""
+
+    def test_compute_port_jitter_deterministic(self):
+        # Same job id always returns the same offset.
+        assert compute_port_jitter("144826") == compute_port_jitter("144826")
+        # Mapping: ((id % 5000) * 2) + 1
+        assert compute_port_jitter("12345") == ((12345 % 5000) * 2) + 1
+
+    def test_compute_port_jitter_non_numeric_falls_back(self):
+        assert compute_port_jitter("not-a-number") == 0
+        assert compute_port_jitter("") == 0
+        assert compute_port_jitter(None) == 0
+
+    def test_compute_port_jitter_always_odd(self):
+        """Critical: jitter must be odd so rpc_port (port+236) stays odd.
+
+        Linux ``__inet_hash_connect`` allocates ports for outbound connect()
+        in two passes — even ports first, odd ports only after the entire
+        even pool is exhausted. NIXL/UCX outbound connections during prefill
+        engine init grab even ports preferentially. If our planned rpc_port
+        is even AND inside the kernel ephemeral range
+        (/proc/sys/net/ipv4/ip_local_port_range, default 32768-60999), the
+        kernel snatches it before SGLang can bind.
+        """
+        for jid in ("0", "1", "2", "144826", "144827", "145866", "145867", "9999", "10000", "99999"):
+            j = compute_port_jitter(jid)
+            assert j % 2 == 1, f"jitter for job {jid} must be odd, got {j}"
+
+    def test_compute_port_jitter_range(self):
+        for jid in ("0", "9999", "10000", "10001", "144826"):
+            j = compute_port_jitter(jid)
+            # Odd values in [1, 9999].
+            assert 1 <= j <= 9999
+
+    def test_from_job_id_shifts_bases(self):
+        a = NodePortAllocator.from_job_id("12345")
+        # 12345 % 5000 = 2345 -> jitter = 2345*2 + 1 = 4691
+        assert a.base_http_port == 30000 + 4691
+        assert a.base_bootstrap_port == 31000 + 4691
+        # kv_events / nixl unaffected (they're already globally unique).
+        assert a.base_kv_events_port == 5550
+        assert a.base_nixl_port == 6550
+
+    def test_from_job_id_none_means_no_jitter(self):
+        a = NodePortAllocator.from_job_id(None)
+        assert a.base_http_port == 30000
+        assert a.base_bootstrap_port == 31000
+
+    def test_from_job_id_rpc_port_is_odd(self):
+        """rpc_port (= http_port + 236) must be odd to avoid the kernel
+        even-port-first connect() pool — see test_compute_port_jitter_always_odd."""
+        # Sample the originally-failing run + the second-wave failing runs.
+        for jid in ("144826", "144827", "145866", "145867", "145868", "145872", "145874", "145876"):
+            a = NodePortAllocator.from_job_id(jid)
+            assert (a.base_http_port + 236) % 2 == 1, f"rpc_port for {jid} must be odd"
+
+    def test_endpoints_to_processes_with_jittered_allocator(self):
+        """Jittered allocator shifts http_port + bootstrap_port; sys_port unchanged."""
+        endpoints = allocate_endpoints(
+            num_prefill=1,
+            num_decode=1,
+            num_agg=0,
+            gpus_per_prefill=2,
+            gpus_per_decode=2,
+            gpus_per_agg=8,
+            gpus_per_node=4,
+            available_nodes=("node0",),
+        )
+
+        # job_id 144826 -> jitter = ((144826 % 5000) * 2) + 1 = 9653
+        allocator = NodePortAllocator.from_job_id("144826")
+        expected_jitter = 9653
+        processes = endpoints_to_processes(endpoints, base_sys_port=8081, port_allocator=allocator)
+
+        leaders = [p for p in processes if p.is_leader]
+        assert len(leaders) == 2
+        for leader in leaders:
+            assert leader.http_port >= 30000 + expected_jitter
+        # SGLang's ZMQ rpc_port = http_port + 236; verify it's no longer 30236
+        # AND that it's odd.
+        prefill = [p for p in processes if p.endpoint_mode == "prefill"][0]
+        assert prefill.http_port + 236 != 30236
+        assert (prefill.http_port + 236) % 2 == 1
+        assert prefill.bootstrap_port == 31000 + expected_jitter
+
+    def test_different_job_ids_produce_different_ports(self):
+        """The originally-failing 8 jobs land on 8 distinct rpc_ports."""
+        failing_job_ids = ["144826", "144827", "144828", "144829", "144831", "144832", "144835", "144836"]
+        rpc_ports = set()
+        for jid in failing_job_ids:
+            allocator = NodePortAllocator.from_job_id(jid)
+            rpc_ports.add(allocator.base_http_port + 236)
+        assert len(rpc_ports) == 8
+
+    def test_second_wave_failures_now_get_odd_ports(self):
+        """The 145866-145876 wave failed because they had even rpc_ports.
+
+        Under the new odd-jitter formula they all map to odd rpc_ports — the
+        property that should keep them out of the kernel's even-first
+        connect() pool.
+        """
+        second_wave = ["145866", "145868", "145872", "145874", "145876"]
+        for jid in second_wave:
+            allocator = NodePortAllocator.from_job_id(jid)
+            rpc_port = allocator.base_http_port + 236
+            assert rpc_port % 2 == 1, f"job {jid} must now have odd rpc_port, got {rpc_port}"

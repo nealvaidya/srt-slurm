@@ -26,6 +26,51 @@ from typing import Literal
 WorkerMode = Literal["prefill", "decode", "agg"]
 
 
+PORT_JITTER_MOD = 5000  # Spread per-job http port over 5000 odd values (1, 3, …, 9999).
+
+
+def compute_port_jitter(job_id: str | None, mod: int = PORT_JITTER_MOD) -> int:
+    """Deterministic per-job ODD offset to avoid cross-job port collisions.
+
+    SGLang's DP-attention path derives ZMQ TCP ports from --port (rpc_port =
+    port + 236). Two failure modes drive this jitter:
+
+    1. **Cross-job leak** — when every job uses --port 30000, a leaked
+       process from a previous run on the recycled physical node holds
+       the deterministic rpc_port and the new run can't bind.
+    2. **Kernel even-port preference** — Linux ``__inet_hash_connect``
+       allocates ports for outbound connect() in two passes: even ports
+       first, odd ports only after the entire even pool is exhausted (see
+       ``net/ipv4/inet_hashtables.c`` — ``offset &= ~1U`` then
+       ``port += 2``). NIXL/UCX/NCCL/torch.distributed open many outbound
+       sockets during prefill engine init; if our planned ``rpc_port`` is
+       both inside the kernel's ephemeral range
+       (``/proc/sys/net/ipv4/ip_local_port_range``, default 32768-60999)
+       AND even, the kernel happily hands it to one of those connect()
+       calls before SGLang's later ``bind('tcp://127.0.0.1:<port>')`` can
+       claim it (see ``engine.py:225``). Result: ``zmq.error.ZMQError:
+       Address already in use`` ~15 min into engine init, after model load.
+
+    Forcing the offset ODD (since 236 is even, parity is preserved
+    rpc_port == http_port mod 2) keeps rpc_port out of the kernel's
+    first-pass connect() pool. Empirically: the 5 jobs that hit failure
+    mode 2 in the 145859-145876 sweep all had even job IDs (and thus
+    even rpc_ports under the previous mod=10000 jitter); the matching
+    odd-id jobs all succeeded the prefill stage.
+
+    Mapping: ``((job_id % 5000) * 2) + 1`` → distinct odd values in
+    [1, 9999], period 5000 jobs. Two consecutive job IDs always land on
+    different odd offsets (delta = 2).
+    """
+    if job_id is None:
+        return 0
+    try:
+        return ((int(job_id) % mod) * 2) + 1
+    except (TypeError, ValueError):
+        # Non-numeric job id (tests, manual invocations) — no jitter.
+        return 0
+
+
 @dataclass
 class NodePortAllocator:
     """Allocates unique ports per node to avoid conflicts.
@@ -49,6 +94,10 @@ class NodePortAllocator:
 
         # Different node starts fresh
         port3 = allocator.next_http_port("node1")  # 30000
+
+    Use ``NodePortAllocator.from_job_id(job_id)`` to construct an allocator
+    whose ``base_http_port`` and ``base_bootstrap_port`` are shifted by a
+    deterministic per-job offset — see ``compute_port_jitter``.
     """
 
     base_http_port: int = 30000
@@ -60,6 +109,20 @@ class NodePortAllocator:
     _bootstrap_ports: dict[str, int] = field(default_factory=dict, repr=False)
     _next_kv_events_port: int = field(default=0, repr=False)  # Global counter
     _next_nixl_port: int = field(default=0, repr=False)  # Global counter for NIXL
+
+    @classmethod
+    def from_job_id(cls, job_id: str | None) -> "NodePortAllocator":
+        """Build an allocator with per-job jitter applied to base_http/bootstrap ports.
+
+        Within one job, http_base and bootstrap_base move by the same offset,
+        preserving the 1000-port gap that keeps them from colliding (rpc_port
+        only reaches +237 from http_base).
+        """
+        jitter = compute_port_jitter(job_id)
+        return cls(
+            base_http_port=30000 + jitter,
+            base_bootstrap_port=31000 + jitter,
+        )
 
     def next_http_port(self, node: str) -> int:
         """Get next available HTTP port for a node."""
