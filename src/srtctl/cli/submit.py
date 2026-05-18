@@ -780,6 +780,7 @@ def submit_sweep(
     setup_script: str | None = None,
     tags: list[str] | None = None,
     output_dir: Path | None = None,
+    enforce_preflight: bool = True,
 ):
     """Submit parameter sweep.
 
@@ -789,6 +790,8 @@ def submit_sweep(
         setup_script: Optional custom setup script name
         tags: Optional list of tags
         output_dir: Custom output directory (CLI flag, highest priority)
+        enforce_preflight: When False, skip the pre-submit model/container/telemetry
+            FS checks for every variant (propagated to submit_single).
     """
     from srtctl.core.sweep import generate_sweep_configs
 
@@ -863,6 +866,7 @@ def submit_sweep(
                 setup_script=setup_script,
                 tags=tags,
                 output_dir=output_dir,
+                enforce_preflight=enforce_preflight,
             )
         finally:
             with contextlib.suppress(OSError):
@@ -893,6 +897,7 @@ def submit_directory(
     tags: list[str] | None = None,
     force_sweep: bool = False,
     output_dir: Path | None = None,
+    enforce_preflight: bool = True,
 ) -> None:
     """Submit all YAML configs in a directory recursively.
 
@@ -903,6 +908,9 @@ def submit_directory(
         tags: Optional list of tags
         force_sweep: If True, treat all configs as sweeps
         output_dir: Custom output directory (CLI flag, highest priority)
+        enforce_preflight: When False, skip the pre-submit model/container/telemetry
+            FS checks for every config (propagated to submit_single / submit_sweep /
+            submit_override).
     """
     yaml_files = find_yaml_files(directory)
 
@@ -942,12 +950,31 @@ def submit_directory(
 
         try:
             if is_override_config(yaml_file):
-                submit_override(yaml_file, dry_run=dry_run, setup_script=setup_script, tags=tags, output_dir=output_dir)
+                submit_override(
+                    yaml_file,
+                    dry_run=dry_run,
+                    setup_script=setup_script,
+                    tags=tags,
+                    output_dir=output_dir,
+                    enforce_preflight=enforce_preflight,
+                )
             elif force_sweep or is_sweep_config(yaml_file):
-                submit_sweep(yaml_file, dry_run=dry_run, setup_script=setup_script, tags=tags, output_dir=output_dir)
+                submit_sweep(
+                    yaml_file,
+                    dry_run=dry_run,
+                    setup_script=setup_script,
+                    tags=tags,
+                    output_dir=output_dir,
+                    enforce_preflight=enforce_preflight,
+                )
             else:
                 submit_single(
-                    config_path=yaml_file, dry_run=dry_run, setup_script=setup_script, tags=tags, output_dir=output_dir
+                    config_path=yaml_file,
+                    dry_run=dry_run,
+                    setup_script=setup_script,
+                    tags=tags,
+                    output_dir=output_dir,
+                    enforce_preflight=enforce_preflight,
                 )
             success_count += 1
         except Exception as e:
@@ -1050,6 +1077,7 @@ def submit_override(
     setup_script: str | None = None,
     tags: list[str] | None = None,
     output_dir: Path | None = None,
+    enforce_preflight: bool = True,
 ) -> None:
     """Expand an override config file and submit each variant.
 
@@ -1063,6 +1091,9 @@ def submit_override(
         setup_script: Optional custom setup script name
         tags: Optional list of tags
         output_dir: Custom output directory
+        enforce_preflight: When False, skip the pre-submit model/container/telemetry
+            FS checks for every expanded variant (propagated to submit_single /
+            submit_sweep).
     """
     with open(config_path) as f:
         raw_config = yaml.safe_load(f)
@@ -1112,6 +1143,7 @@ def submit_override(
                     setup_script=setup_script,
                     tags=tags,
                     output_dir=output_dir,
+                    enforce_preflight=enforce_preflight,
                 )
             finally:
                 with contextlib.suppress(OSError):
@@ -1127,6 +1159,7 @@ def submit_override(
                 variant_suffix=suffix,
                 source_config_path=config_path,
                 runtime_config_text=runtime_config_text,
+                enforce_preflight=enforce_preflight,
             )
 
 
@@ -1240,6 +1273,18 @@ def main():
         default=0.2,
         dest="mock_tick_s",
         help="Per-phase wall time used by the detached mock worker.",
+    )
+    apply_parser.add_argument(
+        "--no-preflight",
+        action="store_true",
+        dest="no_preflight",
+        help=(
+            "Skip the pre-submit model.path / model.container / telemetry filesystem "
+            "checks. Useful when those paths only exist on compute nodes (e.g. node-local "
+            "NVMe like /scratch/models/...) and not on the node invoking srtctl. The "
+            "framework itself will still fail loudly at runtime if a path is genuinely "
+            "missing on the compute node."
+        ),
     )
 
     dry_run_parser = subparsers.add_parser("dry-run", help="Validate without submitting")
@@ -1431,6 +1476,13 @@ def main():
             setup_script = getattr(args, "setup_script", None)
             output_dir = getattr(args, "output_dir", None)
 
+            # --no-preflight is only registered on the apply parser, so
+            # dry-run / preflight / resolve-override won't carry it. Default
+            # to False on those subcommands; dry-run already implies no
+            # enforcement via the is_dry_run branch below.
+            no_preflight = getattr(args, "no_preflight", False)
+            enforce_preflight = not (mock_mode or is_dry_run or no_preflight)
+
             # Handle directory input
             if effective_config_path.is_dir():
                 if selector:
@@ -1442,6 +1494,7 @@ def main():
                     tags=tags,
                     force_sweep=args.sweep,
                     output_dir=output_dir,
+                    enforce_preflight=enforce_preflight,
                 )
             elif is_override_config(effective_config_path):
                 submit_override(
@@ -1451,6 +1504,7 @@ def main():
                     setup_script=setup_script,
                     tags=tags,
                     output_dir=output_dir,
+                    enforce_preflight=enforce_preflight,
                 )
             else:
                 if selector:
@@ -1463,6 +1517,7 @@ def main():
                         setup_script=setup_script,
                         tags=tags,
                         output_dir=output_dir,
+                        enforce_preflight=enforce_preflight,
                     )
                 else:
                     submit_single(
@@ -1471,7 +1526,7 @@ def main():
                         setup_script=setup_script,
                         tags=tags,
                         output_dir=output_dir,
-                        enforce_preflight=not (mock_mode or is_dry_run),
+                        enforce_preflight=enforce_preflight,
                     )
     except Exception as e:
         # Restore subprocess.run etc. before we exit so in-process test

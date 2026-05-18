@@ -200,6 +200,7 @@ class BenchmarkStageMixin:
             container_image=str(container_image),
             container_mounts=container_mounts,
             env_to_set=env_to_set,
+            srun_options=self.runtime.srun_options,
         )
 
         try:
