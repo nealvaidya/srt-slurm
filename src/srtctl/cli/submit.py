@@ -277,7 +277,7 @@ def show_config_details(config: SrtConfig) -> None:
 
     # --- srun options ---
     if config.srun_options:
-        opts = " ".join(f"--{k} {v}" if v else f"--{k}" for k, v in config.srun_options.items())
+        opts = " ".join(f"--{k}={v}" if v else f"--{k}" for k, v in config.srun_options.items())
         console.print(f"[dim]srun options:[/] {opts}")
 
     show_extensions = (

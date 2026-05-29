@@ -220,7 +220,7 @@ def start_srun_process(
     if oversubscribe:
         srun_cmd.append("--oversubscribe")
     if cpu_bind:
-        srun_cmd.extend(["--cpu-bind", cpu_bind])
+        srun_cmd.append(f"--cpu-bind={cpu_bind}")
 
     srun_cmd.extend(["--nodes", str(nodes)])
     srun_cmd.extend(["--ntasks", str(ntasks)])
@@ -244,11 +244,10 @@ def start_srun_process(
             mount_str = ",".join(f"{host}:{container}" for host, container in container_mounts.items())
             srun_cmd.extend(["--container-mounts", mount_str])
 
-    # Additional srun options
     if srun_options:
         for key, value in srun_options.items():
             if value:
-                srun_cmd.extend([f"--{key}", value])
+                srun_cmd.append(f"--{key}={value}")
             else:
                 srun_cmd.append(f"--{key}")
 

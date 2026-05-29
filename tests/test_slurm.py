@@ -96,6 +96,24 @@ def test_cluster_bash_preamble_warns_when_bash_wrapper_disabled(caplog) -> None:
     assert any("default_bash_preamble" in record.message for record in caplog.records)
 
 
+def test_srun_options_use_equals_separator() -> None:
+    with (
+        patch("srtctl.core.slurm.get_slurm_job_id", return_value="12345"),
+        patch("srtctl.core.slurm._get_cluster_bash_preamble", return_value=None),
+        patch("subprocess.Popen") as mock_popen,
+    ):
+        mock_popen.return_value = MagicMock()
+        start_srun_process(
+            ["python3", "-m", "server"],
+            srun_options={"cpu-bind": "none", "export": "ALL", "exclusive": ""},
+        )
+
+    srun_cmd = mock_popen.call_args.args[0]
+    assert "--cpu-bind=none" in srun_cmd
+    assert "--export=ALL" in srun_cmd
+    assert "--exclusive" in srun_cmd
+
+
 def test_wrapped_nonfatal_hook_does_not_mask_prior_preamble_failure() -> None:
     bash_cmd = "false && ( false || true ) && echo main"
 

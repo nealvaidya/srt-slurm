@@ -218,8 +218,8 @@ class TestDryRunSrunOptions:
         config = _make_config({"srun_options": {"export": "ALL", "cpu-bind": "none"}})
         show_config_details(config)
         output = capsys.readouterr().out
-        assert "--export ALL" in output
-        assert "--cpu-bind none" in output
+        assert "--export=ALL" in output
+        assert "--cpu-bind=none" in output
 
     def test_no_srun_options_no_output(self, capsys):
         config = _make_config()
