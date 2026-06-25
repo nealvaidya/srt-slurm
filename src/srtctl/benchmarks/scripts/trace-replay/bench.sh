@@ -112,8 +112,12 @@ export PATH="${AIPERF_VENV}/bin:${PATH}"
 echo "aiperf $(aiperf --version 2>/dev/null || echo 'installed') in ${AIPERF_VENV}"
 
 # Run small benchmark for warmup
+# Keep this cap warmup-only. Scenario-level max_tokens would also cap the measured trace replay.
 echo "Running warmup..."
 WARMUP_DIR="${ARTIFACT_DIR}/warmup"
+WARMUP_MAX_TOKENS="${AIPERF_WARMUP_MAX_TOKENS:-512}"
+WARMUP_EXTRA_INPUTS=${AIPERF_WARMUP_EXTRA_INPUTS:-"{\"ignore_eos\":true,\"max_tokens\":${WARMUP_MAX_TOKENS}}"}
+echo "Warmup extra inputs: ${WARMUP_EXTRA_INPUTS}"
 mkdir -p "${WARMUP_DIR}"
 aiperf profile \
     -m "${MODEL_NAME}" \
@@ -122,10 +126,11 @@ aiperf profile \
     --url "${ENDPOINT}" \
     --streaming \
     --ui simple \
-    --extra-inputs ignore_eos:true \
     --concurrency 1 \
     --request-count 5 \
-    --artifact-dir "${WARMUP_DIR}"
+    --artifact-dir "${WARMUP_DIR}" \
+    "${EXTRA_ARGS[@]}" \
+    --extra-inputs "${WARMUP_EXTRA_INPUTS}"
 echo "Warmup complete"
 
 # Setup artifact directory
