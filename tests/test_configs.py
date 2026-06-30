@@ -210,6 +210,9 @@ class TestDynamoConfig:
         assert "/configs/dynamo-wheels/abc123/.complete" in cmd
         assert "flock -x 200" in cmd
         assert "/configs/dynamo-wheels/.abc123.lock" in cmd
+        assert "/configs/dynamo-wheels/abc123/build.log" in cmd
+        assert "Dynamo source build failed; showing" in cmd
+        assert "tail -200 /configs/dynamo-wheels/abc123/build.log" in cmd
 
         # Cold-cache build still does git clone + checkout + maturin build
         assert "git clone" in cmd

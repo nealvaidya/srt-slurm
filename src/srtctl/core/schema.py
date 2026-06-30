@@ -1046,6 +1046,7 @@ def _hash_cached_source_install(dynamo_hash: str) -> str:
     """
     cache = f"{_DYNAMO_CACHE_ROOT}/{dynamo_hash}"
     lock = f"{_DYNAMO_CACHE_ROOT}/.{dynamo_hash}.lock"
+    build_log = f"{cache}/build.log"
     return (
         f"echo 'Installing dynamo from source ({dynamo_hash}, /configs cache)...' && "
         f"mkdir -p {_DYNAMO_CACHE_ROOT} && "
@@ -1054,8 +1055,13 @@ def _hash_cached_source_install(dynamo_hash: str) -> str:
         f"( "
         f"flock -x 200; "
         f"if [ ! -f {cache}/.complete ]; then "
+        # Create the cache before bootstrap so failures leave actionable logs
+        # behind.  The caller's process manager only shows frontend stdout,
+        # while the bootstrap runs with output redirected to this file.
+        f"mkdir -p {cache} && "
         # Build tools — install on cold cache only. apt + protoc + cargo + maturin.
-        f"apt-get update -qq && apt-get install -y -qq libclang-dev curl git protobuf-compiler > /dev/null 2>&1 && "
+        f"if ! ( "
+        f"apt-get update -qq && apt-get install -y -qq libclang-dev curl git protobuf-compiler && "
         f"if ! command -v cargo &>/dev/null; then "
         f"curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable -q && "
         f". $HOME/.cargo/env; fi && "
@@ -1081,6 +1087,11 @@ def _hash_cached_source_install(dynamo_hash: str) -> str:
         f"tar --exclude='target' --exclude='.git' -czf {cache}/dynamo-src.tar.gz dynamo && "
         f"touch {cache}/.complete && "
         f"cd / && rm -rf $DYN_BUILD_DIR; "
+        f") > {build_log} 2>&1; then "
+        f"echo 'Dynamo source build failed; showing {build_log}' >&2; "
+        f"tail -200 {build_log} >&2; "
+        f"exit 1; "
+        f"fi; "
         f"fi "
         f") 200>{lock} && "
         # Install from the (now warm) cache. Both branches above land here.
