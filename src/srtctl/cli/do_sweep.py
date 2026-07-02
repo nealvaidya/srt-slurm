@@ -668,6 +668,7 @@ class SweepOrchestrator(
             logger.info("Cleanup")
             stop_event.set()
             registry.cleanup()
+            self.finalize_telemetry()
             if exit_code != 0:
                 registry.print_failure_details()
             # Post-process first: generate rollup, upload logs to S3, eagerly

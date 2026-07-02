@@ -57,6 +57,7 @@ def generate_telemetry_config(
         for process in node_processes:
             for gpu_idx in sorted(process.gpu_indices):
                 gpu_metadata[str(gpu_idx)] = {
+                    **node_metadata,
                     "worker_index": str(process.endpoint_index),
                     "worker_process": str(process.node_rank),
                     "worker_role": process.endpoint_mode,
@@ -120,7 +121,10 @@ def generate_telemetry_config(
 
     return _dump_toml(
         endpoints=endpoints,
-        storage=f"/logs/{telemetry.storage_subdir}",
+        # Tachometer accepts an existing directory through its file:// URL
+        # handling.  The equivalent bare local path is intentionally rejected
+        # once srt-slurm has pre-created the telemetry directory.
+        storage=f"file:///logs/{telemetry.storage_subdir}",
     )
 
 

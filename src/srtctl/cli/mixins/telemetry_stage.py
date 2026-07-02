@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import shlex
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +21,8 @@ if TYPE_CHECKING:
     from srtctl.core.topology import Process
 
 logger = logging.getLogger(__name__)
+
+TELEMETRY_FINALIZE_TIMEOUT_SECS = 300
 
 
 class TelemetryStageMixin:
@@ -84,6 +87,10 @@ class TelemetryStageMixin:
                 container_mounts=self.runtime.container_mounts,
                 srun_options=self.runtime.srun_options,
                 het_group=het_group,
+                # Exporter images are commonly scratch-based and contain no
+                # shell.  Their commands need neither environment setup nor a
+                # cluster bash preamble, so execute them directly.
+                use_bash_wrapper=False,
             )
             chunk_name = name if len(chunks) == 1 else f"{name}_g{group_id}"
             managed.append(
@@ -183,3 +190,82 @@ class TelemetryStageMixin:
         )
         logger.info("Telemetry started with artifacts under %s", telemetry_dir)
         return processes
+
+    def finalize_telemetry(self) -> Path | None:
+        """Ensure a final telemetry parquet exists before post-processing.
+
+        Generic process cleanup terminates the local ``srun`` client, which
+        may kill the remote scraper before Tachometer can finish its signal
+        handler.  Recover from the durable Arrow/parquet checkpoints with the
+        scraper's own compact command before the log directory is uploaded.
+        """
+        telemetry = self.config.telemetry
+        if not telemetry.enabled or telemetry.container_image is None:
+            return None
+
+        telemetry_dir = self.runtime.log_dir / telemetry.storage_subdir
+        final_path = telemetry_dir / "final.parquet"
+        if final_path.exists():
+            logger.info("Telemetry final parquet already exists: %s", final_path)
+            return final_path
+
+        local_dir = telemetry_dir / "local"
+        checkpoint_files = [local_dir / "current.arrow"]
+        checkpoint_files.extend(local_dir.glob("out-*.parquet"))
+        checkpoint_files.extend(local_dir.glob("incomplete-*.parquet"))
+        if not any(path.is_file() for path in checkpoint_files):
+            logger.warning("Telemetry finalization skipped: no checkpoints under %s", local_dir)
+            return None
+
+        container_local_dir = f"/logs/{telemetry.storage_subdir}/local"
+        container_output = f"file:///logs/{telemetry.storage_subdir}"
+        log_file = self.runtime.log_dir / "telemetry_finalize.out"
+        command = [
+            telemetry.binary_path,
+            "compact",
+            container_local_dir,
+            "--output",
+            container_output,
+        ]
+        logger.info("Finalizing telemetry checkpoints into %s", final_path)
+        try:
+            proc = start_srun_process(
+                command=command,
+                nodelist=[self.runtime.nodes.head],
+                output=str(log_file),
+                container_image=telemetry.container_image,
+                container_mounts=self.runtime.container_mounts,
+                srun_options=self.runtime.srun_options,
+                het_group=self.runtime.nodes.het_group_for(self.runtime.nodes.head),
+                use_bash_wrapper=False,
+            )
+        except Exception as exc:
+            logger.warning("Unable to launch telemetry finalization: %s", exc)
+            return None
+        try:
+            return_code = proc.wait(timeout=TELEMETRY_FINALIZE_TIMEOUT_SECS)
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "Telemetry finalization timed out after %ss; terminating compact process",
+                TELEMETRY_FINALIZE_TIMEOUT_SECS,
+            )
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            return None
+        except Exception as exc:
+            logger.warning("Telemetry finalization process failed: %s", exc)
+            return None
+
+        if return_code != 0:
+            logger.warning("Telemetry finalization failed with exit code %s; see %s", return_code, log_file)
+            return None
+        if not final_path.is_file():
+            logger.warning("Telemetry compact command completed without producing %s", final_path)
+            return None
+
+        logger.info("Telemetry finalization complete: %s", final_path)
+        return final_path
