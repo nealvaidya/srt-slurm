@@ -184,7 +184,10 @@ class TelemetryStageMixin:
         local_dir.mkdir(parents=True, exist_ok=True)
         fpm_socket_dir: Path | None = None
         if telemetry.forward_pass_metrics.enabled:
-            fpm_socket_dir = Path(f"/tmp/srtctl-fpm-{self.runtime.job_id}")
+            # The orchestrator and Pyxis job steps may not share node-local
+            # /tmp. Keep the Unix socket under the job log directory, which is
+            # already shared and mounted into every telemetry process.
+            fpm_socket_dir = self.runtime.log_dir / "fpm"
             fpm_socket_dir.mkdir(parents=True, exist_ok=True)
             for stale_path in (
                 fpm_socket_dir / "fpm.sock",

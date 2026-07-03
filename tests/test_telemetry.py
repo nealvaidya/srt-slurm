@@ -299,7 +299,11 @@ class TestTelemetryStageMixin:
         assert fpm_call["env_to_set"]["DYN_EVENT_PLANE"] == "zmq"
         assert fpm_call["env_to_set"]["DYN_REQUEST_PLANE"] == "tcp"
         assert "NATS_SERVER" not in fpm_call["env_to_set"]
-        assert fpm_call["container_mounts"][Path("/tmp/srtctl-fpm-12345")] == Path("/fpm")
+        shared_fpm_dir = tmp_path / "fpm"
+        scraper_call = mock_srun.call_args_list[-2].kwargs
+        assert shared_fpm_dir.is_dir()
+        assert scraper_call["container_mounts"][shared_fpm_dir] == Path("/fpm")
+        assert fpm_call["container_mounts"][shared_fpm_dir] == Path("/fpm")
 
     @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
     def test_finalize_telemetry_compacts_checkpoints(self, mock_srun, tmp_path):
