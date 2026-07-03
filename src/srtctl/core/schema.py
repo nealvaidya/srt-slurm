@@ -1079,7 +1079,10 @@ def _hash_cached_source_install(dynamo_hash: str) -> str:
         f"mkdir -p {cache} && "
         # Build tools — install on cold cache only. apt + protoc + cargo + maturin.
         f"if ! ( "
-        f"apt-get update -qq && apt-get install -y -qq libclang-dev curl git protobuf-compiler && "
+        f"apt-get update -qq && "
+        f"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "
+        f"-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "
+        f"libclang-dev curl git protobuf-compiler && "
         f"if ! command -v cargo &>/dev/null; then "
         f"curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable -q && "
         f". $HOME/.cargo/env; fi && "

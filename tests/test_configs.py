@@ -213,6 +213,9 @@ class TestDynamoConfig:
         assert "/configs/dynamo-wheels/abc123/build.log" in cmd
         assert "Dynamo source build failed; showing" in cmd
         assert "tail -200 /configs/dynamo-wheels/abc123/build.log" in cmd
+        assert "DEBIAN_FRONTEND=noninteractive apt-get install" in cmd
+        assert "Dpkg::Options::=--force-confdef" in cmd
+        assert "Dpkg::Options::=--force-confold" in cmd
 
         # Cold-cache build still does git clone + checkout + maturin build
         assert "git clone" in cmd
