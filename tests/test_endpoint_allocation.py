@@ -275,6 +275,8 @@ class TestEndpointsToProcesses:
         assert child.http_port == 0
         # All processes in prefill endpoint share the same bootstrap port
         assert child.bootstrap_port == leader.bootstrap_port
+        assert leader.fpm_publisher is True
+        assert child.fpm_publisher is False
 
     def test_cuda_visible_devices(self):
         """Test that CUDA_VISIBLE_DEVICES is set correctly for each process."""
@@ -343,6 +345,42 @@ class TestEndpointsToProcesses:
         assert processes[0].kv_events_port != processes[1].kv_events_port
         assert processes[0].kv_events_port == 5550
         assert processes[1].kv_events_port == 5551
+
+    def test_fpm_base_ports_reserve_ranges_for_colocated_workers(self):
+        endpoints = allocate_endpoints(
+            num_prefill=2,
+            num_decode=0,
+            num_agg=0,
+            gpus_per_prefill=2,
+            gpus_per_decode=2,
+            gpus_per_agg=8,
+            gpus_per_node=4,
+            available_nodes=("node0",),
+        )
+
+        processes = endpoints_to_processes(endpoints)
+
+        assert [process.fpm_port for process in processes] == [20380, 20508]
+
+    def test_vllm_dp_ranks_are_all_expected_fpm_publishers(self):
+        from srtctl.backends import VLLMProtocol, VLLMServerConfig
+        from srtctl.core.topology import Endpoint
+
+        backend = VLLMProtocol(
+            vllm_config=VLLMServerConfig(decode={"data-parallel-size": 2, "tensor-parallel-size": 2})
+        )
+        endpoint = Endpoint(
+            mode="decode",
+            index=0,
+            nodes=("node0",),
+            gpu_indices=frozenset(range(4)),
+            gpus_per_node=4,
+        )
+
+        processes = backend.endpoints_to_processes([endpoint])
+
+        assert len(processes) == 2
+        assert all(process.fpm_publisher for process in processes)
 
     def test_nixl_port_allocation(self):
         """Test NIXL ports are allocated globally unique starting at 6550."""

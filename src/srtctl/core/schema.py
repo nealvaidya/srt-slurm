@@ -856,6 +856,23 @@ class TelemetryExporterConfig:
 
 
 @dataclass(frozen=True)
+class ForwardPassMetricsTelemetryConfig:
+    """Dynamo forward-pass metrics collection configuration.
+
+    FPM publishers and the collector communicate through Dynamo's event plane.
+    The SRT integration deliberately fixes that plane to ZMQ; NATS remains the
+    request plane for the serving deployment.
+    """
+
+    enabled: bool = False
+    namespace: str = "dynamo"
+    ready_timeout_secs: int = 600
+    connect_timeout_secs: int = 120
+
+    Schema: ClassVar[type[Schema]] = Schema
+
+
+@dataclass(frozen=True)
 class TelemetryConfig:
     """Telemetry configuration for benchmark jobs.
 
@@ -874,6 +891,7 @@ class TelemetryConfig:
     extra_metadata: dict[str, str] = field(default_factory=dict)
     dcgm_exporter: TelemetryExporterConfig | None = None
     node_exporter: TelemetryExporterConfig | None = None
+    forward_pass_metrics: ForwardPassMetricsTelemetryConfig = field(default_factory=ForwardPassMetricsTelemetryConfig)
 
     Schema: ClassVar[type[Schema]] = Schema
 
@@ -1173,6 +1191,8 @@ class SrtConfig:
         """Validate telemetry configuration."""
         telemetry = self.telemetry
         if not telemetry.enabled:
+            if telemetry.forward_pass_metrics.enabled:
+                raise ValidationError("telemetry.forward_pass_metrics requires telemetry.enabled=true")
             return
 
         if telemetry.provider != TelemetryProvider.SCRAPER:
@@ -1190,6 +1210,13 @@ class SrtConfig:
             raise ValidationError("telemetry.sync_interval_secs must be >= 0")
         if telemetry.compaction_threads < 0:
             raise ValidationError("telemetry.compaction_threads must be >= 0")
+        if telemetry.forward_pass_metrics.enabled:
+            if self.frontend.type != "dynamo":
+                raise ValidationError("telemetry.forward_pass_metrics requires frontend.type=dynamo")
+            if telemetry.forward_pass_metrics.ready_timeout_secs <= 0:
+                raise ValidationError("telemetry.forward_pass_metrics.ready_timeout_secs must be positive")
+            if telemetry.forward_pass_metrics.connect_timeout_secs <= 0:
+                raise ValidationError("telemetry.forward_pass_metrics.connect_timeout_secs must be positive")
 
     @classmethod
     def from_yaml(cls, yaml_path: Path) -> "SrtConfig":

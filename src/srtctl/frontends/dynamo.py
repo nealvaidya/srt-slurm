@@ -83,13 +83,15 @@ class DynamoFrontend:
                 "NATS_SERVER": f"nats://{runtime.nodes.infra}:4222",
                 "DYN_REQUEST_PLANE": "nats",
             }
-
             # Add OTEL env vars (before frontend env so OTEL_SERVICE_NAME can be overridden)
             env_to_set.update(build_otel_env(config.observability, "frontend"))
 
             # Add frontend env from config
             if config.frontend.env:
                 env_to_set.update(config.frontend.env)
+            fpm_config = getattr(getattr(config, "telemetry", None), "forward_pass_metrics", None)
+            if getattr(fpm_config, "enabled", False) is True:
+                env_to_set["DYN_EVENT_PLANE"] = "zmq"
 
             # Build bash preamble (setup script + dynamo install)
             bash_preamble = self._build_preamble(config)

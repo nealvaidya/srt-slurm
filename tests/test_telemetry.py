@@ -13,6 +13,7 @@ from srtctl.cli.mixins.frontend_stage import FrontendTopology
 from srtctl.cli.mixins.telemetry_stage import TelemetryStageMixin
 from srtctl.core.schema import (
     BenchmarkConfig,
+    ForwardPassMetricsTelemetryConfig,
     ModelConfig,
     ResourceConfig,
     SrtConfig,
@@ -44,6 +45,12 @@ class TestTelemetryConfig:
                     dcgm_exporter=TelemetryExporterConfig(container_image="dcgm:latest", port=9401),
                     node_exporter=TelemetryExporterConfig(container_image="node:latest", port=9101),
                 )
+            )
+
+    def test_forward_pass_metrics_requires_telemetry(self):
+        with pytest.raises(ValidationError, match="telemetry.enabled=true"):
+            _make_config(
+                telemetry=TelemetryConfig(forward_pass_metrics=ForwardPassMetricsTelemetryConfig(enabled=True))
             )
 
 
@@ -107,6 +114,60 @@ class TestTelemetryConfigGeneration:
         assert '"cluster" = "pdx"' in config_text
         assert 'name = "frontend0"' in config_text
 
+    @patch("srtctl.core.telemetry.get_hostname_ip", return_value="10.0.0.1")
+    def test_generate_forward_pass_metrics_config(self, _mock_get_hostname_ip):
+        telemetry = TelemetryConfig(
+            enabled=True,
+            container_image="telemetry:latest",
+            forward_pass_metrics=ForwardPassMetricsTelemetryConfig(enabled=True),
+            extra_metadata={"cluster": "pdx"},
+            dcgm_exporter=TelemetryExporterConfig(container_image="dcgm:latest", port=9401),
+            node_exporter=TelemetryExporterConfig(container_image="node:latest", port=9101),
+        )
+        runtime = MagicMock(job_id="12345", run_name="test_12345", network_interface="eth0")
+        processes = [
+            Process(
+                node="node-a",
+                gpu_indices=frozenset({0}),
+                sys_port=8081,
+                http_port=30000,
+                endpoint_mode="prefill",
+                endpoint_index=0,
+                fpm_publisher=True,
+            ),
+            Process(
+                node="node-a",
+                gpu_indices=frozenset({1}),
+                sys_port=8082,
+                http_port=31000,
+                endpoint_mode="decode",
+                endpoint_index=0,
+                fpm_publisher=True,
+            ),
+        ]
+        topology = FrontendTopology(
+            nginx_node=None,
+            frontend_nodes=["node-a"],
+            frontend_port=8000,
+            public_port=8000,
+        )
+
+        config_text = generate_telemetry_config(
+            processes=processes,
+            frontend_topology=topology,
+            runtime=runtime,
+            telemetry=telemetry,
+        )
+
+        assert "[fpm]" in config_text
+        assert 'socket_path = "/fpm/fpm.sock"' in config_text
+        assert "[fpm.expected_workers]" in config_text
+        assert '"prefill" = 1' in config_text
+        assert '"backend" = 1' in config_text
+        assert "[fpm.component_roles]" in config_text
+        assert '"backend" = "decode"' in config_text
+        assert '"cluster" = "pdx"' in config_text
+
 
 class TestTelemetryStageMixin:
     """Telemetry stage startup."""
@@ -162,3 +223,59 @@ class TestTelemetryStageMixin:
         assert (tmp_path / "telemetry_config.toml").exists()
         assert (tmp_path / "telemetry" / "local").exists()
         assert mock_srun.call_count == 3
+
+    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.generate_telemetry_config", return_value='storage = "/logs/telemetry"\n')
+    def test_start_telemetry_starts_dynamo_fpm_exporter(self, _mock_config, mock_srun, tmp_path):
+        class Harness(TelemetryStageMixin):
+            def __init__(self):
+                self.config = _make_config(
+                    telemetry=TelemetryConfig(
+                        enabled=True,
+                        container_image="telemetry:latest",
+                        forward_pass_metrics=ForwardPassMetricsTelemetryConfig(enabled=True),
+                        dcgm_exporter=TelemetryExporterConfig(container_image="dcgm:latest", port=9401),
+                        node_exporter=TelemetryExporterConfig(container_image="node:latest", port=9101),
+                    )
+                )
+                self.runtime = MagicMock()
+                self.runtime.job_id = "12345"
+                self.runtime.log_dir = tmp_path
+                self.runtime.container_image = "/model-image"
+                self.runtime.nodes.head = "node-a"
+                self.runtime.nodes.infra = "node-a"
+                self.runtime.srun_options = {}
+                self.runtime.container_mounts = {Path(tmp_path): Path("/logs")}
+                self._backend_processes = [
+                    Process(
+                        node="node-a",
+                        gpu_indices=frozenset({0}),
+                        sys_port=8081,
+                        http_port=30000,
+                        endpoint_mode="agg",
+                        endpoint_index=0,
+                    )
+                ]
+
+            @property
+            def backend_processes(self):
+                return self._backend_processes
+
+            def _compute_frontend_topology(self):
+                return FrontendTopology(
+                    nginx_node=None,
+                    frontend_nodes=["node-a"],
+                    frontend_port=8000,
+                    public_port=8000,
+                )
+
+        mock_srun.return_value = MagicMock()
+
+        procs = Harness().start_telemetry()
+
+        assert len(procs) == 4
+        fpm_call = mock_srun.call_args_list[-1].kwargs
+        assert fpm_call["command"][-2:] == ["--component", "backend"]
+        assert fpm_call["env_to_set"]["DYN_EVENT_PLANE"] == "zmq"
+        assert fpm_call["env_to_set"]["DYN_REQUEST_PLANE"] == "tcp"
+        assert "NATS_SERVER" not in fpm_call["env_to_set"]

@@ -118,13 +118,41 @@ def generate_telemetry_config(
             )
         )
 
+    fpm_config: dict[str, object] | None = None
+    if telemetry.forward_pass_metrics.enabled:
+        publishers_by_mode = {
+            mode: [process for process in processes if process.endpoint_mode == mode and process.fpm_publisher]
+            for mode in ("prefill", "decode", "agg")
+        }
+        expected_workers: dict[str, int] = {}
+        component_roles: dict[str, str] = {}
+        if publishers_by_mode["prefill"]:
+            expected_workers["prefill"] = len(publishers_by_mode["prefill"])
+            component_roles["prefill"] = "prefill"
+        backend_publishers = publishers_by_mode["decode"] + publishers_by_mode["agg"]
+        if backend_publishers:
+            expected_workers["backend"] = len(backend_publishers)
+            component_roles["backend"] = "decode" if publishers_by_mode["decode"] else "agg"
+
+        metadata = {"job_id": runtime.job_id, "run_name": runtime.run_name}
+        metadata.update(telemetry.extra_metadata)
+        fpm_config = {
+            "socket_path": "/fpm/fpm.sock",
+            "ready_path": f"/logs/{telemetry.storage_subdir}/fpm.ready",
+            "manifest_path": f"/logs/{telemetry.storage_subdir}/fpm_manifest.json",
+            "expected_workers": expected_workers,
+            "component_roles": component_roles,
+            "metadata": metadata,
+        }
+
     return _dump_toml(
         endpoints=endpoints,
         storage=f"/logs/{telemetry.storage_subdir}",
+        fpm=fpm_config,
     )
 
 
-def _dump_toml(*, endpoints: list[TelemetryEndpoint], storage: str) -> str:
+def _dump_toml(*, endpoints: list[TelemetryEndpoint], storage: str, fpm: dict[str, object] | None) -> str:
     """Render a compact TOML document without extra dependencies."""
     lines = [f"storage = {json.dumps(storage)}", ""]
     for endpoint in endpoints:
@@ -143,5 +171,19 @@ def _dump_toml(*, endpoints: list[TelemetryEndpoint], storage: str) -> str:
             for gpu_idx, metadata in sorted(endpoint.gpu_metadata.items(), key=lambda item: int(item[0])):
                 fields = ", ".join(f"{json.dumps(k)} = {json.dumps(v)}" for k, v in sorted(metadata.items()))
                 lines.append(f"{json.dumps(gpu_idx)} = {{ {fields} }}")
+        lines.append("")
+
+    if fpm is not None:
+        lines.append("[fpm]")
+        lines.append(f"socket_path = {json.dumps(fpm['socket_path'])}")
+        lines.append(f"ready_path = {json.dumps(fpm['ready_path'])}")
+        lines.append(f"manifest_path = {json.dumps(fpm['manifest_path'])}")
+        for table in ("expected_workers", "component_roles", "metadata"):
+            values = fpm[table]
+            if not isinstance(values, dict) or not values:
+                continue
+            lines.append(f"[fpm.{table}]")
+            for key, value in sorted(values.items()):
+                lines.append(f"{json.dumps(key)} = {json.dumps(value)}")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"

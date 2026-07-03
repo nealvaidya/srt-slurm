@@ -416,6 +416,8 @@ class SweepOrchestrator(
             telemetry_procs = self.start_telemetry()
             for proc in telemetry_procs:
                 registry.add_process(proc)
+            if not self.wait_for_telemetry_ready(registry, stop_event):
+                raise RuntimeError("Telemetry did not become ready")
 
             self._print_connection_info()
 

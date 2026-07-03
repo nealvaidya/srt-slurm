@@ -37,6 +37,7 @@ class NodePortAllocator:
     Port ranges (non-overlapping):
         - kv_events_port: 5550+  (global) - ZMQ port for kv-events publishing
         - nixl_port:      6550+  (global) - NIXL side channel for KV transfers (vLLM)
+        - fpm_port:       20380+ (per node, stride 128) - raw backend FPM transport
         - http_port:      30000+ (per node) - HTTP serving port
         - bootstrap_port: 31000+ (per node) - P/D coordination port (prefill only)
 
@@ -55,9 +56,12 @@ class NodePortAllocator:
     base_bootstrap_port: int = 31000
     base_kv_events_port: int = 5550
     base_nixl_port: int = 6550  # NIXL side channel ports (must not overlap with kv_events)
+    base_fpm_port: int = 20380
+    fpm_port_stride: int = 128
 
     _http_ports: dict[str, int] = field(default_factory=dict, repr=False)
     _bootstrap_ports: dict[str, int] = field(default_factory=dict, repr=False)
+    _fpm_ports: dict[str, int] = field(default_factory=dict, repr=False)
     _next_kv_events_port: int = field(default=0, repr=False)  # Global counter
     _next_nixl_port: int = field(default=0, repr=False)  # Global counter for NIXL
 
@@ -91,6 +95,18 @@ class NodePortAllocator:
             self._next_nixl_port = self.base_nixl_port
         port = self._next_nixl_port
         self._next_nixl_port += 1
+        return port
+
+    def next_fpm_port(self, node: str) -> int:
+        """Get a collision-free FPM base port for a worker process on a node.
+
+        Dynamo vLLM adds the global DP rank to this base. Reserving a range per
+        process keeps co-located endpoints from binding the same raw ZMQ port.
+        """
+        if node not in self._fpm_ports:
+            self._fpm_ports[node] = self.base_fpm_port
+        port = self._fpm_ports[node]
+        self._fpm_ports[node] += self.fpm_port_stride
         return port
 
 
@@ -152,6 +168,8 @@ class Process:
         bootstrap_port: P/D coordination port (only for prefill leaders)
         kv_events_port: ZMQ port for kv-events publishing (all worker leaders)
         nixl_port: NIXL side channel port for KV transfers (vLLM only)
+        fpm_port: Base port for backend-local forward-pass metrics publishing
+        fpm_publisher: Whether this process is expected to register an FPM worker
         endpoint_mode: The mode of the parent endpoint
         endpoint_index: The index of the parent endpoint
         node_rank: Rank within the endpoint (0 for leader)
@@ -167,6 +185,8 @@ class Process:
     bootstrap_port: int | None = None
     kv_events_port: int | None = None
     nixl_port: int | None = None
+    fpm_port: int | None = None
+    fpm_publisher: bool = False
 
     @property
     def is_leader(self) -> bool:
@@ -409,6 +429,7 @@ def endpoints_to_processes(
 
             # Allocate NIXL side channel port (globally unique, used by vLLM)
             node_nixl_port = port_allocator.next_nixl_port()
+            node_fpm_port = port_allocator.next_fpm_port(node)
 
             processes.append(
                 Process(
@@ -422,6 +443,8 @@ def endpoints_to_processes(
                     bootstrap_port=endpoint_bootstrap_port,
                     kv_events_port=node_kv_events_port,
                     nixl_port=node_nixl_port,
+                    fpm_port=node_fpm_port,
+                    fpm_publisher=is_leader,
                 )
             )
             current_sys_port += 1

@@ -150,7 +150,6 @@ class WorkerStageMixin:
             "DYN_SYSTEM_PORT": str(process.sys_port),
             "DYN_REQUEST_PLANE": "nats",
         }
-
         # Add OTEL env vars (before mode-specific env so OTEL_SERVICE_NAME can be overridden)
         env_to_set.update(build_otel_env(self.config.observability, mode))
 
@@ -184,6 +183,15 @@ class WorkerStageMixin:
 
         # Add backend-specific process environment variables (e.g., unique ports)
         env_to_set.update(self.backend.get_process_environment(process))
+
+        # FPM collection is explicitly bound to Dynamo's ZMQ event plane. Keep
+        # these values authoritative even if a generic recipe environment block
+        # contains stale event-plane settings.
+        if self.config.telemetry.forward_pass_metrics.enabled is True:
+            if process.fpm_port is None:
+                raise ValueError("FPM enabled but no worker FPM port was allocated")
+            env_to_set["DYN_EVENT_PLANE"] = "zmq"
+            env_to_set["DYN_FORWARDPASS_METRIC_PORT"] = str(process.fpm_port)
 
         self._apply_kvbm_endpoint_env(env_to_set, endpoint_processes)
 

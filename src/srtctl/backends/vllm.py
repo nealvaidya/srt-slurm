@@ -233,6 +233,7 @@ class VLLMProtocol:
                     )
                     kv_events_port = port_allocator.next_kv_events_port()
                     nixl_port = port_allocator.next_nixl_port()
+                    fpm_port = port_allocator.next_fpm_port(node)
 
                     processes.append(
                         Process(
@@ -246,6 +247,8 @@ class VLLMProtocol:
                             bootstrap_port=bootstrap_port,
                             kv_events_port=kv_events_port,
                             nixl_port=nixl_port,
+                            fpm_port=fpm_port,
+                            fpm_publisher=is_leader,
                         )
                     )
                     current_sys_port += 1
@@ -284,6 +287,7 @@ class VLLMProtocol:
                     )
                     kv_events_port = port_allocator.next_kv_events_port()
                     nixl_port = port_allocator.next_nixl_port()
+                    fpm_port = port_allocator.next_fpm_port(node)
 
                     processes.append(
                         Process(
@@ -297,6 +301,8 @@ class VLLMProtocol:
                             bootstrap_port=bootstrap_port,
                             kv_events_port=kv_events_port,
                             nixl_port=nixl_port,
+                            fpm_port=fpm_port,
+                            fpm_publisher=True,
                         )
                     )
                     current_sys_port += 1
