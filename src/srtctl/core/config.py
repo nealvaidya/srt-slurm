@@ -114,6 +114,25 @@ def resolve_config_with_defaults(user_config: dict[str, Any], cluster_config: di
         slurm["time_limit"] = cluster_config["default_time_limit"]
         logger.debug(f"Applied default time_limit: {slurm['time_limit']}")
 
+    default_sbatch_directives = cluster_config.get("default_sbatch_directives")
+    if isinstance(default_sbatch_directives, dict):
+        sbatch_directives = config.setdefault("sbatch_directives", {})
+        for key, value in default_sbatch_directives.items():
+            sbatch_directives.setdefault(key, value)
+        logger.debug("Applied default sbatch_directives: %s", default_sbatch_directives)
+
+    # Apply cluster-level het-job default. Without this, a recipe with
+    # `het_jobs: None` would defer the cluster default at render-time but skip
+    # SrtConfig validation (which only fires on `het_jobs is True`). Writing
+    # the cluster value into the resolved recipe ensures __post_init__ catches
+    # bad combinations (het + trtllm, het + agg, ...) at load time.
+    resources = config.get("resources")
+    if isinstance(resources, dict) and resources.get("het_jobs") is None:
+        cluster_het = cluster_config.get("use_het_jobs")
+        if cluster_het is not None:
+            resources["het_jobs"] = bool(cluster_het)
+            logger.debug("Applied cluster use_het_jobs default: %s", cluster_het)
+
     # Resolve model path alias
     model = config.get("model", {})
     model_path = model.get("path", "")
@@ -138,6 +157,10 @@ def resolve_config_with_defaults(user_config: dict[str, Any], cluster_config: di
         config["reporting"] = cluster_config["reporting"]
         logger.debug("Applied cluster reporting config")
 
+    if "health_check" not in config and cluster_config.get("default_health_check"):
+        config["health_check"] = cluster_config["default_health_check"]
+        logger.debug("Applied default_health_check: %s", config["health_check"])
+
     # Resolve frontend nginx_container alias
     frontend = config.get("frontend", {})
     nginx_container = frontend.get("nginx_container", "")
@@ -147,6 +170,48 @@ def resolve_config_with_defaults(user_config: dict[str, Any], cluster_config: di
         frontend["nginx_container"] = resolved_nginx
         config["frontend"] = frontend
         logger.debug(f"Resolved nginx_container alias '{nginx_container}' -> '{resolved_nginx}'")
+
+    # Cluster-level default for nginx nofile ulimit (job yaml wins if present).
+    if "nginx_raise_ulimit" not in frontend and cluster_config.get("nginx_raise_ulimit") is not None:
+        frontend["nginx_raise_ulimit"] = cluster_config["nginx_raise_ulimit"]
+        config["frontend"] = frontend
+        logger.debug(f"Applied cluster nginx_raise_ulimit: {frontend['nginx_raise_ulimit']}")
+
+    # Resolve benchmark.container_image alias for benches that ship their own
+    # eval container (e.g. NeMo Skills for accuracy benchmarks). Mirrors how
+    # model.container and frontend.nginx_container resolve against the same
+    # `containers:` map.
+    benchmark = config.get("benchmark", {})
+    benchmark_container = benchmark.get("container_image", "")
+
+    if containers and benchmark_container in containers:
+        resolved_bench = containers[benchmark_container]
+        benchmark["container_image"] = resolved_bench
+        config["benchmark"] = benchmark
+        logger.debug(f"Resolved benchmark.container_image alias '{benchmark_container}' -> '{resolved_bench}'")
+
+    # Resolve telemetry container aliases (scraper + dcgm/node exporters). All
+    # three are nullable in the schema; only resolve fields that are set.
+    telemetry = config.get("telemetry")
+    if telemetry and containers:
+        scraper_image = telemetry.get("container_image")
+        if scraper_image and scraper_image in containers:
+            resolved_scraper = containers[scraper_image]
+            telemetry["container_image"] = resolved_scraper
+            logger.debug(f"Resolved telemetry.container_image alias '{scraper_image}' -> '{resolved_scraper}'")
+
+        for exporter_key in ("dcgm_exporter", "node_exporter"):
+            exporter = telemetry.get(exporter_key)
+            if not exporter:
+                continue
+            exporter_image = exporter.get("container_image")
+            if exporter_image and exporter_image in containers:
+                resolved_exporter = containers[exporter_image]
+                exporter["container_image"] = resolved_exporter
+                logger.debug(
+                    f"Resolved telemetry.{exporter_key}.container_image alias "
+                    f"'{exporter_image}' -> '{resolved_exporter}'"
+                )
 
     return config
 

@@ -108,10 +108,15 @@ class TestTelemetryConfigGeneration:
             telemetry=telemetry,
         )
 
-        assert 'storage = "/logs/telemetry"' in config_text
+        assert 'storage = "file:///logs/telemetry"' in config_text
         assert 'name = "dcgm_node-a"' in config_text
         assert 'url = "http://10.0.0.1:8081/metrics"' in config_text
         assert '"cluster" = "pdx"' in config_text
+        assert (
+            '"0" = { "cluster" = "pdx", "hostname" = "node-a", "job_id" = "12345", '
+            '"run_name" = "test_12345", "worker_index" = "0", "worker_process" = "0", '
+            '"worker_role" = "prefill" }'
+        ) in config_text
         assert 'name = "frontend0"' in config_text
 
     @patch("srtctl.core.telemetry.get_hostname_ip", return_value="10.0.0.1")
@@ -159,6 +164,7 @@ class TestTelemetryConfigGeneration:
             telemetry=telemetry,
         )
 
+        assert 'storage = "file:///logs/telemetry"' in config_text
         assert "[fpm]" in config_text
         assert 'socket_path = "/fpm/fpm.sock"' in config_text
         assert "[fpm.expected_workers]" in config_text
@@ -173,7 +179,10 @@ class TestTelemetryStageMixin:
     """Telemetry stage startup."""
 
     @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
-    @patch("srtctl.cli.mixins.telemetry_stage.generate_telemetry_config", return_value='storage = "/logs/telemetry"\n')
+    @patch(
+        "srtctl.cli.mixins.telemetry_stage.generate_telemetry_config",
+        return_value='storage = "file:///logs/telemetry"\n',
+    )
     def test_start_telemetry_starts_exporters_and_scraper(self, _mock_config, mock_srun, tmp_path):
         class Harness(TelemetryStageMixin):
             def __init__(self):
@@ -188,6 +197,7 @@ class TestTelemetryStageMixin:
                 self.runtime = MagicMock()
                 self.runtime.log_dir = tmp_path
                 self.runtime.nodes.head = "node-a"
+                self.runtime.nodes.het = False
                 self.runtime.srun_options = {}
                 self.runtime.container_mounts = {Path(tmp_path): Path("/logs")}
                 self._backend_processes = [
@@ -223,9 +233,15 @@ class TestTelemetryStageMixin:
         assert (tmp_path / "telemetry_config.toml").exists()
         assert (tmp_path / "telemetry" / "local").exists()
         assert mock_srun.call_count == 3
+        assert mock_srun.call_args_list[0].kwargs["use_bash_wrapper"] is False
+        assert mock_srun.call_args_list[1].kwargs["use_bash_wrapper"] is False
+        assert "use_bash_wrapper" not in mock_srun.call_args_list[2].kwargs
 
     @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
-    @patch("srtctl.cli.mixins.telemetry_stage.generate_telemetry_config", return_value='storage = "/logs/telemetry"\n')
+    @patch(
+        "srtctl.cli.mixins.telemetry_stage.generate_telemetry_config",
+        return_value='storage = "file:///logs/telemetry"\n',
+    )
     def test_start_telemetry_starts_dynamo_fpm_exporter(self, _mock_config, mock_srun, tmp_path):
         class Harness(TelemetryStageMixin):
             def __init__(self):
@@ -244,6 +260,8 @@ class TestTelemetryStageMixin:
                 self.runtime.container_image = "/model-image"
                 self.runtime.nodes.head = "node-a"
                 self.runtime.nodes.infra = "node-a"
+                self.runtime.nodes.het = False
+                self.runtime.nodes.het_group_for.return_value = None
                 self.runtime.srun_options = {}
                 self.runtime.container_mounts = {Path(tmp_path): Path("/logs")}
                 self._backend_processes = [
@@ -254,6 +272,8 @@ class TestTelemetryStageMixin:
                         http_port=30000,
                         endpoint_mode="agg",
                         endpoint_index=0,
+                        fpm_port=20380,
+                        fpm_publisher=True,
                     )
                 ]
 
@@ -279,3 +299,114 @@ class TestTelemetryStageMixin:
         assert fpm_call["env_to_set"]["DYN_EVENT_PLANE"] == "zmq"
         assert fpm_call["env_to_set"]["DYN_REQUEST_PLANE"] == "tcp"
         assert "NATS_SERVER" not in fpm_call["env_to_set"]
+        assert fpm_call["container_mounts"][Path("/tmp/srtctl-fpm-12345")] == Path("/fpm")
+
+    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    def test_finalize_telemetry_compacts_checkpoints(self, mock_srun, tmp_path):
+        harness = TelemetryStageMixin()
+        harness.config = _make_config(
+            telemetry=TelemetryConfig(
+                enabled=True,
+                container_image="telemetry:latest",
+                binary_path="/usr/local/bin/tachometer-scraper",
+                dcgm_exporter=TelemetryExporterConfig(container_image="dcgm:latest", port=9401),
+                node_exporter=TelemetryExporterConfig(container_image="node:latest", port=9101),
+            )
+        )
+        harness.runtime = MagicMock()
+        harness.runtime.log_dir = tmp_path
+        harness.runtime.nodes.head = "node-a"
+        harness.runtime.nodes.het_group_for.return_value = None
+        harness.runtime.container_mounts = {Path(tmp_path): Path("/logs")}
+        harness.runtime.srun_options = {}
+
+        local_dir = tmp_path / "telemetry" / "local"
+        local_dir.mkdir(parents=True)
+        (local_dir / "current.arrow").write_bytes(b"checkpoint")
+
+        proc = MagicMock()
+
+        def _finish_compaction(*, timeout):
+            assert timeout == 300
+            final_path = tmp_path / "telemetry" / "final.parquet"
+            final_path.write_bytes(b"parquet")
+            return 0
+
+        proc.wait.side_effect = _finish_compaction
+        mock_srun.return_value = proc
+
+        result = harness.finalize_telemetry()
+
+        assert result == tmp_path / "telemetry" / "final.parquet"
+        call = mock_srun.call_args
+        assert call.kwargs["command"] == [
+            "/usr/local/bin/tachometer-scraper",
+            "compact",
+            "/logs/telemetry/local",
+            "--output",
+            "file:///logs/telemetry",
+        ]
+        assert call.kwargs["container_image"] == "telemetry:latest"
+        assert call.kwargs["use_bash_wrapper"] is False
+
+    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    def test_finalize_telemetry_skips_without_checkpoints(self, mock_srun, tmp_path):
+        harness = TelemetryStageMixin()
+        harness.config = _make_config(
+            telemetry=TelemetryConfig(
+                enabled=True,
+                container_image="telemetry:latest",
+                dcgm_exporter=TelemetryExporterConfig(container_image="dcgm:latest", port=9401),
+                node_exporter=TelemetryExporterConfig(container_image="node:latest", port=9101),
+            )
+        )
+        harness.runtime = MagicMock()
+        harness.runtime.log_dir = tmp_path
+        (tmp_path / "telemetry" / "local").mkdir(parents=True)
+
+        assert harness.finalize_telemetry() is None
+        mock_srun.assert_not_called()
+
+    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    def test_finalize_telemetry_preserves_existing_final(self, mock_srun, tmp_path):
+        harness = TelemetryStageMixin()
+        harness.config = _make_config(
+            telemetry=TelemetryConfig(
+                enabled=True,
+                container_image="telemetry:latest",
+                dcgm_exporter=TelemetryExporterConfig(container_image="dcgm:latest", port=9401),
+                node_exporter=TelemetryExporterConfig(container_image="node:latest", port=9101),
+            )
+        )
+        harness.runtime = MagicMock()
+        harness.runtime.log_dir = tmp_path
+        final_path = tmp_path / "telemetry" / "final.parquet"
+        final_path.parent.mkdir(parents=True)
+        final_path.write_bytes(b"already-final")
+
+        assert harness.finalize_telemetry() == final_path
+        mock_srun.assert_not_called()
+
+    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process", side_effect=RuntimeError("no step"))
+    def test_finalize_telemetry_launch_failure_is_nonfatal(self, mock_srun, tmp_path):
+        harness = TelemetryStageMixin()
+        harness.config = _make_config(
+            telemetry=TelemetryConfig(
+                enabled=True,
+                container_image="telemetry:latest",
+                dcgm_exporter=TelemetryExporterConfig(container_image="dcgm:latest", port=9401),
+                node_exporter=TelemetryExporterConfig(container_image="node:latest", port=9101),
+            )
+        )
+        harness.runtime = MagicMock()
+        harness.runtime.log_dir = tmp_path
+        harness.runtime.nodes.head = "node-a"
+        harness.runtime.nodes.het_group_for.return_value = None
+        harness.runtime.container_mounts = {Path(tmp_path): Path("/logs")}
+        harness.runtime.srun_options = {}
+        local_dir = tmp_path / "telemetry" / "local"
+        local_dir.mkdir(parents=True)
+        (local_dir / "current.arrow").write_bytes(b"checkpoint")
+
+        assert harness.finalize_telemetry() is None
+        mock_srun.assert_called_once()

@@ -19,9 +19,11 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from srtctl.backends.sglang import SGLangProtocol
 from srtctl.cli.mixins import (
     BenchmarkStageMixin,
     FrontendStageMixin,
@@ -42,8 +44,15 @@ from srtctl.core.runtime import RuntimeContext
 from srtctl.core.schema import SrtConfig
 from srtctl.core.slurm import get_slurm_job_id, start_srun_process
 from srtctl.core.status import JobStage, JobStatus, StatusReporter
-from srtctl.core.topology import Endpoint, Process
+from srtctl.core.topology import Endpoint, NodePortAllocator, Process, allocate_endpoints_het
 from srtctl.logging_utils import setup_logging
+from srtctl.ports import (
+    ETCD_CLIENT_PORT,
+    FRONTEND_PUBLIC_PORT,
+    MOONCAKE_HTTP_METADATA_PORT,
+    MOONCAKE_MASTER_PORT,
+    NATS_PORT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,9 +86,22 @@ class SweepOrchestrator(
     def endpoints(self) -> list[Endpoint]:
         """Compute endpoint allocation topology (cached).
 
-        This is the single source of truth for endpoint assignments.
+        This is the single source of truth for endpoint assignments. Under
+        SLURM heterogeneous jobs, prefill and decode workers are allocated
+        from their own component nodelists so neither side bleeds into the
+        other's topology segment.
         """
         r = self.config.resources
+        if self.runtime.nodes.het:
+            return allocate_endpoints_het(
+                num_prefill=r.num_prefill,
+                gpus_per_prefill=r.gpus_per_prefill,
+                prefill_nodes=self.runtime.nodes.prefill_group,
+                num_decode=r.num_decode,
+                gpus_per_decode=r.gpus_per_decode,
+                decode_nodes=self.runtime.nodes.decode_group,
+                gpus_per_node=r.gpus_per_node,
+            )
         return self.backend.allocate_endpoints(
             num_prefill=r.num_prefill,
             num_decode=r.num_decode,
@@ -89,12 +111,18 @@ class SweepOrchestrator(
             gpus_per_agg=r.gpus_per_agg,
             gpus_per_node=r.gpus_per_node,
             available_nodes=self.runtime.nodes.worker,
+            spread_workers=r.spread_workers,
         )
 
     @functools.cached_property
     def backend_processes(self) -> list[Process]:
-        """Compute physical process topology from endpoints (cached)."""
-        return self.backend.endpoints_to_processes(self.endpoints)
+        """Compute physical process topology from endpoints (cached).
+
+        Port defaults come from ``srtctl.ports`` and are allocated
+        deterministically within a job.
+        """
+        allocator = NodePortAllocator()
+        return self.backend.endpoints_to_processes(self.endpoints, port_allocator=allocator)
 
     def start_head_infrastructure(self, registry: ProcessRegistry) -> ManagedProcess:
         """Start NATS and etcd on the infra node.
@@ -136,6 +164,7 @@ class SweepOrchestrator(
             output=str(infra_log),
             container_image=str(self.runtime.container_image),
             container_mounts=mounts,
+            het_group=self.runtime.nodes.het_group_for(infra_node),
         )
 
         managed = ManagedProcess(
@@ -147,15 +176,85 @@ class SweepOrchestrator(
         )
 
         # 300s timeout to handle slow container imports on first run
-        logger.info("Waiting for NATS (port 4222) on %s...", infra_node)
-        if not wait_for_port(infra_node, 4222, timeout=300):
+        logger.info("Waiting for NATS (port %d) on %s...", NATS_PORT, infra_node)
+        if not wait_for_port(infra_node, NATS_PORT, timeout=300):
             raise RuntimeError("NATS failed to start")
         logger.info("NATS is ready")
 
-        logger.info("Waiting for etcd (port 2379) on %s...", infra_node)
-        if not wait_for_port(infra_node, 2379, timeout=300):
+        logger.info("Waiting for etcd (port %d) on %s...", ETCD_CLIENT_PORT, infra_node)
+        if not wait_for_port(infra_node, ETCD_CLIENT_PORT, timeout=300):
             raise RuntimeError("etcd failed to start")
         logger.info("etcd is ready")
+
+        return managed
+
+    def start_mooncake_master(self, registry: ProcessRegistry) -> ManagedProcess | None:
+        """Launch mooncake_master on the infra node if mooncake_kv_store is configured.
+
+        Runs on the same node as etcd/nats. Uses mooncake_kv_store.container if set,
+        otherwise falls back to the job container.
+
+        We always start the master with its embedded HTTP metadata server enabled
+        (`--enable_http_metadata_server=true`) so:
+
+        1. Workers can use ``MOONCAKE_TE_META_DATA_SERVER=http://infra:<metadata-port>/metadata``
+           without a separate metadata service.
+        2. Dynamo's KV router shared-cache path
+           (`lib/llm/src/kv_router/shared_cache.rs`) can call the master's
+           ``/batch_query_keys`` endpoint for L3 reach when
+           ``--shared-cache-type hicache`` is set on the frontend.
+        """
+        if not isinstance(self.config.backend, SGLangProtocol):
+            return None
+        mooncake_cfg = self.config.backend.mooncake_kv_store
+        if mooncake_cfg is None:
+            return None
+
+        infra_node = self.runtime.nodes.infra
+        container = mooncake_cfg.container or str(self.runtime.container_image)
+        mooncake_log = self.runtime.log_dir / "mooncake_master.out"
+
+        logger.info(
+            "Starting mooncake_master on %s (rpc=%d, http_metadata=%d)",
+            infra_node,
+            MOONCAKE_MASTER_PORT,
+            MOONCAKE_HTTP_METADATA_PORT,
+        )
+
+        proc = start_srun_process(
+            command=[
+                "mooncake_master",
+                f"--port={MOONCAKE_MASTER_PORT}",
+                "--enable_http_metadata_server=true",
+                f"--http_metadata_server_port={MOONCAKE_HTTP_METADATA_PORT}",
+                "--eviction_high_watermark_ratio=0.95",
+            ],
+            nodelist=[infra_node],
+            output=str(mooncake_log),
+            container_image=container,
+            container_mounts=self.runtime.container_mounts,
+            het_group=self.runtime.nodes.het_group_for(infra_node),
+        )
+
+        managed = ManagedProcess(
+            name="mooncake_master",
+            popen=proc,
+            log_file=mooncake_log,
+            node=infra_node,
+            critical=True,
+        )
+
+        logger.info("Waiting for mooncake_master RPC (port %d) on %s...", MOONCAKE_MASTER_PORT, infra_node)
+        if not wait_for_port(infra_node, MOONCAKE_MASTER_PORT, timeout=120):
+            raise RuntimeError("mooncake_master RPC failed to start")
+        logger.info(
+            "Waiting for mooncake_master HTTP metadata (port %d) on %s...",
+            MOONCAKE_HTTP_METADATA_PORT,
+            infra_node,
+        )
+        if not wait_for_port(infra_node, MOONCAKE_HTTP_METADATA_PORT, timeout=120):
+            raise RuntimeError("mooncake_master HTTP metadata server failed to start")
+        logger.info("mooncake_master is ready")
 
         return managed
 
@@ -170,7 +269,7 @@ class SweepOrchestrator(
         logger.info("=" * 60)
         logger.info("Connection Commands")
         logger.info("=" * 60)
-        logger.info("Frontend URL: http://%s:8000", self.runtime.nodes.head)
+        logger.info("Frontend URL: http://%s:%d", self.runtime.nodes.head, FRONTEND_PUBLIC_PORT)
         logger.info("")
         logger.info("To connect to head node (%s):", self.runtime.nodes.head)
         logger.info(
@@ -336,6 +435,7 @@ class SweepOrchestrator(
                 container_mounts=self.runtime.container_mounts,
                 env_to_set=hf_env,
                 use_bash_wrapper=False,  # command is already bash -c
+                het_group=self.runtime.nodes.het_group_for(download_node),
             )
 
             timeout_sec = 60 * 60  # 1 hour; large models can take a while
@@ -361,6 +461,119 @@ class SweepOrchestrator(
                 logger.info("Model pre-download complete")
         except Exception:
             logger.warning("Model pre-download failed (workers will retry at startup)", exc_info=True)
+
+    def _run_post_eval(self, stop_event: threading.Event) -> int:
+        """Run lm-eval after the main benchmark completes (or directly in eval-only mode)."""
+        from srtctl.benchmarks import get_runner
+        from srtctl.core.health import wait_for_model
+
+        # In eval-only mode the benchmark health check was skipped, so do the
+        # full model-ready wait here.  In post-benchmark mode a quick port
+        # check is sufficient since the server already served traffic.
+        if os.environ.get("EVAL_ONLY", "false").lower() == "true":
+            r = self.config.resources
+            n_prefill = 0 if r.num_agg > 0 else r.num_prefill
+            n_decode = r.num_agg if r.num_agg > 0 else r.num_decode
+            hc = self.config.health_check
+            logger.info("EVAL_ONLY: Waiting for server health before eval...")
+            if not wait_for_model(
+                host=self.runtime.nodes.head,
+                port=FRONTEND_PUBLIC_PORT,
+                n_prefill=n_prefill,
+                n_decode=n_decode,
+                poll_interval=float(hc.interval_seconds),
+                timeout=float(hc.max_attempts * hc.interval_seconds),
+                report_every=60.0,
+                frontend_type=self.config.frontend.type,
+                stop_event=stop_event,
+            ):
+                logger.error("Server did not become healthy for eval")
+                return 1
+        else:
+            if not wait_for_port(self.runtime.nodes.head, FRONTEND_PUBLIC_PORT, timeout=30):
+                logger.error("Server health check failed before eval - skipping")
+                return 1
+
+        try:
+            runner = get_runner("lm-eval")
+        except ValueError as e:
+            logger.error("lm-eval runner not available: %s", e)
+            return 1
+
+        eval_log = self.runtime.log_dir / "eval.out"
+        cmd = runner.build_command(self.config, self.runtime)
+
+        logger.info("Eval command: %s", " ".join(cmd))
+        logger.info("Eval log: %s", eval_log)
+
+        # Pass through eval-related env vars. InferenceX writes multi-node
+        # metadata from these variables in append_lm_eval_summary().
+        env_to_set = {}
+        for var in [
+            "RUN_EVAL",
+            "EVAL_ONLY",
+            "IS_MULTINODE",
+            "FRAMEWORK",
+            "PRECISION",
+            "MODEL_PREFIX",
+            "RUNNER_TYPE",
+            "RESULT_FILENAME",
+            "SPEC_DECODING",
+            "ISL",
+            "OSL",
+            "MODEL",
+            "MODEL_PATH",
+            "MAX_MODEL_LEN",
+            "EVAL_MAX_MODEL_LEN",
+            "PREFILL_TP",
+            "PREFILL_EP",
+            "PREFILL_DP_ATTN",
+            "PREFILL_NUM_WORKERS",
+            "DECODE_TP",
+            "DECODE_EP",
+            "DECODE_DP_ATTN",
+            "DECODE_NUM_WORKERS",
+        ]:
+            val = os.environ.get(var)
+            if val:
+                env_to_set[var] = val
+
+        # Set MODEL_NAME to the served model name so lm-eval uses the correct
+        # name for API requests. Without this, benchmark_lib.sh falls back to
+        # $MODEL (the HuggingFace ID) which the server doesn't recognize.
+        env_to_set["MODEL_NAME"] = self.config.served_model_name
+        logger.info("Eval MODEL_NAME: %s", env_to_set["MODEL_NAME"])
+
+        # Use EVAL_CONC from workflow (median chosen by InferenceX mark_eval_entries),
+        # falling back to max of benchmark concurrency list.
+        eval_conc = os.environ.get("EVAL_CONC")
+        if eval_conc:
+            env_to_set["EVAL_CONC"] = eval_conc
+            logger.info("Eval concurrency (from workflow): %s", eval_conc)
+        else:
+            conc_list = self.config.benchmark.get_concurrency_list()
+            if conc_list:
+                env_to_set["EVAL_CONC"] = str(max(conc_list))
+                logger.info("Eval concurrency (max of %s): %s", conc_list, env_to_set["EVAL_CONC"])
+
+        proc = start_srun_process(
+            command=cmd,
+            nodelist=[self.runtime.nodes.head],
+            output=str(eval_log),
+            container_image=str(self.runtime.container_image),
+            container_mounts=self.runtime.container_mounts,
+            env_to_set=env_to_set,
+            het_group=self.runtime.nodes.het_group_for(self.runtime.nodes.head),
+        )
+
+        while proc.poll() is None:
+            if stop_event.is_set():
+                logger.info("Stop requested, terminating eval")
+                proc.terminate()
+                return 1
+            time.sleep(1)
+
+        return proc.returncode or 0
 
     def run(self) -> int:
         """Run the complete sweep."""
@@ -394,6 +607,11 @@ class SweepOrchestrator(
             head_proc = self.start_head_infrastructure(registry)
             registry.add_process(head_proc)
 
+            # Stage 1b: Mooncake master (optional, co-located with infra node)
+            mooncake_proc = self.start_mooncake_master(registry)
+            if mooncake_proc is not None:
+                registry.add_process(mooncake_proc)
+
             # Pre-worker: Ensure HF model is cached before starting workers.
             # 1. Clean stale lock files from previous crashed downloads
             # 2. Download model on a single node (blocks until complete)
@@ -421,8 +639,27 @@ class SweepOrchestrator(
 
             self._print_connection_info()
 
-            # Stage 4: Benchmark (status reported AFTER health check passes)
-            exit_code = self.run_benchmark(registry, stop_event, reporter)
+            if os.environ.get("EVAL_ONLY", "false").lower() == "true":
+                reporter.report(JobStatus.BENCHMARK, JobStage.BENCHMARK, "Running eval-only evaluation")
+                logger.info("EVAL_ONLY=true: Skipping benchmark stage and running lm-eval evaluation...")
+                exit_code = self._run_post_eval(stop_event)
+                if exit_code != 0:
+                    logger.error("Eval-only evaluation failed with exit code %d", exit_code)
+                else:
+                    logger.info("Eval-only evaluation completed successfully")
+            else:
+                # Stage 4: Benchmark (status reported AFTER health check passes)
+                exit_code = self.run_benchmark(registry, stop_event, reporter)
+
+                # Stage 5: Post-benchmark eval (optional, non-fatal)
+                if os.environ.get("RUN_EVAL", "false").lower() == "true" and exit_code == 0:
+                    reporter.report(JobStatus.BENCHMARK, JobStage.BENCHMARK, "Running post-benchmark evaluation")
+                    logger.info("RUN_EVAL=true: Running post-benchmark lm-eval evaluation...")
+                    eval_exit = self._run_post_eval(stop_event)
+                    if eval_exit != 0:
+                        logger.warning("Eval failed with exit code %d (benchmark result is still valid)", eval_exit)
+                    else:
+                        logger.info("Post-benchmark eval completed successfully")
 
         except Exception as e:
             logger.exception("Error during sweep: %s", e)
@@ -433,6 +670,7 @@ class SweepOrchestrator(
             logger.info("Cleanup")
             stop_event.set()
             registry.cleanup()
+            self.finalize_telemetry()
             if exit_code != 0:
                 registry.print_failure_details()
             # Post-process first: generate rollup, upload logs to S3, eagerly

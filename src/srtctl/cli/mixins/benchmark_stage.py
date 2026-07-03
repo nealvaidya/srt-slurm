@@ -19,6 +19,7 @@ from srtctl.core.health import wait_for_model
 from srtctl.core.lockfile import collect_worker_fingerprints
 from srtctl.core.slurm import get_hostname_ip, start_srun_process
 from srtctl.core.status import JobStage, JobStatus, StatusReporter
+from srtctl.ports import FRONTEND_PUBLIC_PORT, SGLANG_HTTP_PORT_BASE
 
 if TYPE_CHECKING:
     from srtctl.benchmarks.base import BenchmarkRunner
@@ -80,7 +81,7 @@ class BenchmarkStageMixin:
         hc = self.config.health_check
         if not wait_for_model(
             host=self.runtime.nodes.head,
-            port=8000,
+            port=FRONTEND_PUBLIC_PORT,
             n_prefill=n_prefill,
             n_decode=n_decode,
             poll_interval=float(hc.interval_seconds),
@@ -130,7 +131,7 @@ class BenchmarkStageMixin:
 
         if benchmark_type == "manual":
             logger.info("Benchmark type is 'manual' - server is ready for testing")
-            logger.info("Frontend URL: http://%s:8000", self.runtime.nodes.head)
+            logger.info("Frontend URL: http://%s:%d", self.runtime.nodes.head, FRONTEND_PUBLIC_PORT)
             logger.info("Press Ctrl+C to stop the job")
 
             while not stop_event.is_set():
@@ -176,6 +177,7 @@ class BenchmarkStageMixin:
         stop_event: threading.Event,
     ) -> int:
         """Run the actual benchmark script."""
+        from srtctl.analysis.live_metrics import try_start_snapshotter
 
         cmd = runner.build_command(self.config, self.runtime)
         env_to_set = self._get_benchmark_env(runner)
@@ -187,6 +189,10 @@ class BenchmarkStageMixin:
         logger.info("Command: %s", shlex.join(cmd))
         logger.info("Log: %s", log_file)
 
+        # Optional in-flight batch-metrics snapshotter — no-op unless
+        # opted in via reporting.live_metrics in the cluster config.
+        snapshotter = try_start_snapshotter(self.runtime.log_dir, stop_event)
+
         proc = start_srun_process(
             command=cmd,
             nodelist=[self.runtime.nodes.head],
@@ -194,17 +200,21 @@ class BenchmarkStageMixin:
             container_image=str(container_image),
             container_mounts=container_mounts,
             env_to_set=env_to_set,
+            srun_options=self.runtime.srun_options,
+            het_group=self.runtime.nodes.het_group_for(self.runtime.nodes.head),
         )
 
-        # Wait for benchmark to complete
-        while proc.poll() is None:
-            if stop_event.is_set():
-                logger.info("Stop requested, terminating benchmark")
-                proc.terminate()
-                return 1
-            time.sleep(1)
-
-        return proc.returncode or 0
+        try:
+            while proc.poll() is None:
+                if stop_event.is_set():
+                    logger.info("Stop requested, terminating benchmark")
+                    proc.terminate()
+                    return 1
+                time.sleep(1)
+            return proc.returncode or 0
+        finally:
+            if snapshotter is not None:
+                snapshotter.stop()
 
     def _get_benchmark_profiling_env(self, runner: "BenchmarkRunner") -> dict[str, str]:
         """Get environment variables for the benchmark script."""
@@ -286,12 +296,46 @@ class BenchmarkStageMixin:
             env["BENCH_MODEL_NAME"] = self.config.served_model_name
             env["HEAD_NODE"] = self.runtime.nodes.head
             env["HEAD_PORT"] = str(self.runtime.frontend_port)
+            env["PROFILE_WORKER_PORT"] = str(SGLANG_HTTP_PORT_BASE)
 
         # Let benchmark scripts know the backend type so they can select the right profiling lib
         if self.config.backend_type == "trtllm":
             env["PROFILING_BACKEND"] = "trtllm"
 
         return env
+
+    def _get_sa_bench_slow_down_env(self) -> dict[str, str]:
+        """Build SA-Bench slow_down env from benchmark config and decode worker leaders."""
+        b = self.config.benchmark
+        if b.slow_down_sleep_time is None or b.slow_down_wait_time is None:
+            return {}
+        if b.slow_down_sleep_time <= 0 or b.slow_down_wait_time <= 0:
+            logger.warning(
+                "benchmark slow_down: slow_down_sleep_time and slow_down_wait_time must be positive; skipping"
+            )
+            return {}
+        if self.config.frontend.type != "sglang":
+            logger.warning("benchmark.slow_down_* ignored: frontend.type is not sglang")
+            return {}
+
+        decode_urls: list[str] = []
+        for process in self.backend_processes:
+            if not process.is_leader:
+                continue
+            if process.endpoint_mode != "decode":
+                continue
+            leader_ip = get_hostname_ip(process.node, self.runtime.network_interface)
+            decode_urls.append(f"http://{leader_ip}:{process.http_port}")
+
+        if not decode_urls:
+            logger.warning("benchmark slow_down requested but no decode worker leaders found; skipping slow_down env")
+            return {}
+
+        return {
+            "SA_BENCH_SLOW_DOWN_URLS": ",".join(decode_urls),
+            "SA_BENCH_SLOW_DOWN_SLEEP_TIME": str(b.slow_down_sleep_time),
+            "SA_BENCH_SLOW_DOWN_WAIT_TIME": str(b.slow_down_wait_time),
+        }
 
     def _get_aiperf_server_metrics_env(self) -> dict[str, str]:
         """Build server metrics URLs for AIPerf benchmarks.
@@ -326,6 +370,16 @@ class BenchmarkStageMixin:
 
         env = self._get_benchmark_profiling_env(runner)
         env["SRTCTL_FRONTEND_TYPE"] = self.config.frontend.type
+
+        # Propagate top-level recipe environment to the bench step. Workers
+        # already get this via worker_stage; benches need it too for things
+        # like HF_TOKEN that the bench script may consume (e.g. NeMo Skills
+        # dataset prep against gated HF datasets).
+        for key, value in self.runtime.environment.items():
+            env[key] = value
+
+        if runner.name == "SA-Bench":
+            env.update(self._get_sa_bench_slow_down_env())
 
         # Add AIPerf-specific env vars for AIPerf-driven benchmarks only
         if isinstance(runner, AIPerfBenchmarkRunner):

@@ -77,6 +77,18 @@ fi
 CHAT_TEMPLATE_ARGS=()
 if [ "$USE_CHAT_TEMPLATE" = "true" ]; then
     CHAT_TEMPLATE_ARGS=(--use-chat-template)
+    if [ -z "$CUSTOM_TOKENIZER" ]; then
+        echo "[sa-bench] notice: use_chat_template=true but no custom_tokenizer set."
+        echo "[sa-bench]   Models without a jinja chat_template (e.g. DeepSeek-V4)"
+        echo "[sa-bench]   will fail fast in benchmark_serving.py with guidance."
+        echo "[sa-bench]   For vLLM DSV4, set:"
+        echo "[sa-bench]     benchmark.custom_tokenizer:"
+        echo "[sa-bench]       sa_bench_tokenizers.vllm_deepseek_v4.VLLMDeepseekV4Tokenizer"
+        echo "[sa-bench]   For SGLang DSV4, set:"
+        echo "[sa-bench]     benchmark.custom_tokenizer:"
+        echo "[sa-bench]       sa_bench_tokenizers.sglang_deepseek_v4.SGLangDeepseekV4Tokenizer"
+        echo "[sa-bench]   Or set benchmark.use_chat_template: false to skip it."
+    fi
 fi
 
 # Build dataset args
@@ -92,7 +104,31 @@ if [ "$DATASET_NAME" = "random" ]; then
         --random-input-len "$ISL"
         --random-output-len "$OSL"
         --random-range-ratio "${RANDOM_RANGE_RATIO}"
+        # 0 delegates worker selection to benchmark_serving.py; override via RANDOM_NUM_WORKERS.
+        --random-num-workers "${RANDOM_NUM_WORKERS:-0}"
     )
+fi
+
+# Optional SGLang /slow_down (set by srtctl for SA-Bench when YAML provides slow_down_* and frontend is sglang):
+#   SA_BENCH_SLOW_DOWN_URLS: comma-separated http://host:port base URLs (decode workers)
+#   SA_BENCH_SLOW_DOWN_SLEEP_TIME / SA_BENCH_SLOW_DOWN_WAIT_TIME
+SLOW_DOWN_ARGS=()
+if [ -n "${SA_BENCH_SLOW_DOWN_URLS:-}" ]; then
+    IFS=',' read -r -a _sd_urls <<< "${SA_BENCH_SLOW_DOWN_URLS}"
+    for u in "${_sd_urls[@]}"; do
+        u="$(echo "$u" | xargs)"
+        if [ -n "$u" ]; then
+            SLOW_DOWN_ARGS+=(--slow-down-server "$u")
+        fi
+    done
+fi
+if [ ${#SLOW_DOWN_ARGS[@]} -gt 0 ]; then
+    SLOW_DOWN_EXTRA=(
+        --slow-down-sleep-time "${SA_BENCH_SLOW_DOWN_SLEEP_TIME:-1}"
+        --slow-down-wait-time "${SA_BENCH_SLOW_DOWN_WAIT_TIME:-60}"
+    )
+else
+    SLOW_DOWN_EXTRA=()
 fi
 
 # Parse endpoint into host:port
@@ -143,21 +179,24 @@ start_all_profiling
 
 for concurrency in "${CONCURRENCY_LIST[@]}"; do
 
-    num_warmup_prompts=$((concurrency * NUM_WARMUP_MULT))
-    python3 -u "${WORK_DIR}/benchmark_serving.py" \
-        --model "${MODEL_NAME}" --tokenizer "${MODEL_PATH}" \
-        --host "$HOST" --port "$PORT" \
-        --backend "dynamo" --endpoint /v1/completions \
-        --disable-tqdm \
-        "${DATASET_ARGS[@]}" \
-        --num-prompts "$num_warmup_prompts" \
-        "${RANDOM_LEN_ARGS[@]}" \
-        --ignore-eos \
-        --request-rate 250 \
-        --percentile-metrics ttft,tpot,itl,e2el \
-        --max-concurrency "$concurrency" \
-        --trust-remote-code \
-        "${CUSTOM_TOKENIZER_ARGS[@]}"
+    if [ "$NUM_WARMUP_MULT" -gt 0 ]; then
+        num_warmup_prompts=$((concurrency * NUM_WARMUP_MULT))
+        python3 -u "${WORK_DIR}/benchmark_serving.py" \
+            --model "${MODEL_NAME}" --tokenizer "${MODEL_PATH}" \
+            --host "$HOST" --port "$PORT" \
+            --backend "dynamo" --endpoint /v1/completions \
+            --disable-tqdm \
+            "${DATASET_ARGS[@]}" \
+            --num-prompts "$num_warmup_prompts" \
+            "${RANDOM_LEN_ARGS[@]}" \
+            --ignore-eos \
+            --request-rate 250 \
+            --percentile-metrics ttft,tpot,itl,e2el \
+            --max-concurrency "$concurrency" \
+            --trust-remote-code \
+            "${CHAT_TEMPLATE_ARGS[@]}" \
+            "${CUSTOM_TOKENIZER_ARGS[@]}"
+    fi
 
     num_prompts=$((concurrency * NUM_PROMPTS_MULT))
 
@@ -187,6 +226,8 @@ for concurrency in "${CONCURRENCY_LIST[@]}"; do
         --trust-remote-code \
         "${CHAT_TEMPLATE_ARGS[@]}" \
         "${CUSTOM_TOKENIZER_ARGS[@]}" \
+        "${SLOW_DOWN_ARGS[@]}" \
+        "${SLOW_DOWN_EXTRA[@]}" \
         --save-result --result-dir "$result_dir" --result-filename "$result_filename"
     set +x
 
@@ -198,4 +239,3 @@ done
 stop_all_profiling
 
 echo "SA-Bench complete. Results in $result_dir"
-

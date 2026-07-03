@@ -16,6 +16,7 @@ from srtctl.core.fingerprint import generate_capture_script
 from srtctl.core.processes import ManagedProcess, NamedProcesses
 from srtctl.core.schema import build_otel_env
 from srtctl.core.slurm import get_hostname_ip, start_srun_process
+from srtctl.ports import ETCD_CLIENT_PORT, KV_EVENTS_PORT_BASE, KVBM_ZMQ_PORT_BASE, NATS_PORT
 
 if TYPE_CHECKING:
     from srtctl.core.runtime import RuntimeContext
@@ -23,6 +24,10 @@ if TYPE_CHECKING:
     from srtctl.core.topology import Endpoint, Process
 
 logger = logging.getLogger(__name__)
+
+# Dynamo runtime (Rust) log filter for worker containers; YAML prefill_environment /
+# decode_environment / aggregated_environment override via the merge below.
+_DEFAULT_WORKER_DYN_LOG = "info,dynamo_runtime::pipeline::network::ingress::push_handler=warn"
 
 
 class WorkerStageMixin:
@@ -64,11 +69,17 @@ class WorkerStageMixin:
         parts = []
 
         # 1. Custom setup script (runs first)
-        if self.config.setup_script:
-            script_path = f"/configs/{self.config.setup_script}"
+        setup_script = getattr(self.config, "setup_script", None)
+        if isinstance(setup_script, str) and setup_script:
+            script_name = shlex.quote(setup_script)
             parts.append(
-                f"echo 'Running setup script: {script_path}' && "
-                f"if [ -f '{script_path}' ]; then bash '{script_path}'; else echo 'WARNING: {script_path} not found'; fi"
+                f"setup_script={script_name} && "
+                'script_path="/configs/${setup_script}" && '
+                'patch_script_path="/configs/patches/${setup_script}" && '
+                'echo "Running setup script: ${script_path} (fallback ${patch_script_path})" && '
+                'if [ -f "${script_path}" ]; then bash "${script_path}"; '
+                'elif [ -f "${patch_script_path}" ]; then bash "${patch_script_path}"; '
+                'else echo "WARNING: ${script_path} or ${patch_script_path} not found"; fi'
             )
 
         # 2. Dynamo installation (required for dynamo.sglang when using dynamo frontend)
@@ -88,7 +99,7 @@ class WorkerStageMixin:
         single-node endpoints, but multi-node endpoints need every worker to
         connect to the leader node. Also assign deterministic per-endpoint ports
         when the user did not set them, so co-located KVBM endpoints do not fight
-        over the default 56001/56002 pair.
+        over the default KVBM leader ZMQ pair.
         """
         if env_to_set.get("DYN_CONNECTOR", "").lower() != "kvbm" or not endpoint_processes:
             return
@@ -103,8 +114,8 @@ class WorkerStageMixin:
         if leader.kv_events_port is None:
             return
 
-        port_offset = max(0, leader.kv_events_port - 5550)
-        pub_port = 56001 + (port_offset * 2)
+        port_offset = max(0, leader.kv_events_port - KV_EVENTS_PORT_BASE)
+        pub_port = KVBM_ZMQ_PORT_BASE + (port_offset * 2)
         ack_port = pub_port + 1
         if ack_port <= 65535:
             env_to_set.setdefault("DYN_KVBM_LEADER_ZMQ_PUB_PORT", str(pub_port))
@@ -145,13 +156,17 @@ class WorkerStageMixin:
         # Environment variables
         env_to_set = {
             "HEAD_NODE_IP": self.runtime.head_node_ip,
-            "ETCD_ENDPOINTS": f"http://{self.runtime.nodes.infra}:2379",
-            "NATS_SERVER": f"nats://{self.runtime.nodes.infra}:4222",
+            "ETCD_ENDPOINTS": f"http://{self.runtime.nodes.infra}:{ETCD_CLIENT_PORT}",
+            "NATS_SERVER": f"nats://{self.runtime.nodes.infra}:{NATS_PORT}",
             "DYN_SYSTEM_PORT": str(process.sys_port),
             "DYN_REQUEST_PLANE": "nats",
+            "DYN_SKIP_SGLANG_LOG_FORMATTING": "1",
         }
+
         # Add OTEL env vars (before mode-specific env so OTEL_SERVICE_NAME can be overridden)
         env_to_set.update(build_otel_env(self.config.observability, mode))
+
+        env_to_set.setdefault("DYN_LOG", _DEFAULT_WORKER_DYN_LOG)
 
         # Add mode-specific environment variables from backend
         # Support simple {node} and {node_id} templating
@@ -187,11 +202,20 @@ class WorkerStageMixin:
         # FPM collection is explicitly bound to Dynamo's ZMQ event plane. Keep
         # these values authoritative even if a generic recipe environment block
         # contains stale event-plane settings.
-        if self.config.telemetry.forward_pass_metrics.enabled is True:
+        telemetry = getattr(self.config, "telemetry", None)
+        fpm = getattr(telemetry, "forward_pass_metrics", None)
+        if getattr(fpm, "enabled", False) is True:
             if process.fpm_port is None:
                 raise ValueError("FPM enabled but no worker FPM port was allocated")
             env_to_set["DYN_EVENT_PLANE"] = "zmq"
             env_to_set["DYN_FORWARDPASS_METRIC_PORT"] = str(process.fpm_port)
+
+        # Add mooncake worker env vars if configured (SGLang only). Resolve the
+        # worker's own IP so MOONCAKE_LOCAL_HOSTNAME is correct for multi-node
+        # peer-to-peer transfers (defaulting to "localhost" silently breaks them).
+        if hasattr(self.backend, "get_mooncake_worker_env"):
+            local_hostname = get_hostname_ip(process.node, self.runtime.network_interface)
+            env_to_set.update(self.backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname))
 
         self._apply_kvbm_endpoint_env(env_to_set, endpoint_processes)
 
@@ -220,6 +244,7 @@ class WorkerStageMixin:
             env_to_set=env_to_set,
             bash_preamble=bash_preamble,
             srun_options=self.runtime.srun_options,
+            het_group=process.het_group,
         )
 
         return ManagedProcess(
@@ -283,13 +308,16 @@ class WorkerStageMixin:
         # Environment variables
         env_to_set = {
             "HEAD_NODE_IP": self.runtime.head_node_ip,
-            "ETCD_ENDPOINTS": f"http://{self.runtime.nodes.infra}:2379",
-            "NATS_SERVER": f"nats://{self.runtime.nodes.infra}:4222",
+            "ETCD_ENDPOINTS": f"http://{self.runtime.nodes.infra}:{ETCD_CLIENT_PORT}",
+            "NATS_SERVER": f"nats://{self.runtime.nodes.infra}:{NATS_PORT}",
             "DYN_SYSTEM_PORT": str(leader.sys_port),
+            "DYN_SKIP_SGLANG_LOG_FORMATTING": "1",
         }
 
         # Add OTEL env vars (before mode-specific env so OTEL_SERVICE_NAME can be overridden)
         env_to_set.update(build_otel_env(self.config.observability, mode))
+
+        env_to_set.setdefault("DYN_LOG", _DEFAULT_WORKER_DYN_LOG)
 
         # Add mode-specific environment variables from backend
         env_to_set.update(self.backend.get_environment_for_mode(mode))
@@ -305,6 +333,14 @@ class WorkerStageMixin:
         # Set CUDA_VISIBLE_DEVICES if not using all GPUs on the node
         if len(leader.gpu_indices) < self.runtime.gpus_per_node:
             env_to_set["CUDA_VISIBLE_DEVICES"] = leader.cuda_visible_devices
+
+        # Add mooncake worker env vars if configured (SGLang only). For MPI-style
+        # endpoint launching we use the leader node's IP — mooncake's per-worker
+        # hostname is fundamentally per-process, but TRTLLM-style launching uses
+        # one srun for the whole endpoint, so leader IP is the best we can do.
+        if hasattr(self.backend, "get_mooncake_worker_env"):
+            local_hostname = get_hostname_ip(leader.node, self.runtime.network_interface)
+            env_to_set.update(self.backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname))
 
         self._apply_kvbm_endpoint_env(env_to_set, endpoint_processes)
 
@@ -340,6 +376,7 @@ class WorkerStageMixin:
             mpi=srun_config.mpi,
             oversubscribe=srun_config.oversubscribe,
             cpu_bind=srun_config.cpu_bind,
+            het_group=leader.het_group,
         )
 
         return ManagedProcess(

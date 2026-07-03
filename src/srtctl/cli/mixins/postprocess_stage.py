@@ -6,6 +6,7 @@ Post-process stage mixin for SweepOrchestrator.
 
 Handles:
 - Benchmark result extraction
+- Optional node metrics CSV export (``analysis.srtlog``)
 - srtlog parsing and S3 upload
 - AI-powered failure analysis using Claude Code CLI
 
@@ -25,7 +26,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from srtctl.benchmarks.base import SCRIPTS_DIR
-from srtctl.core.config import load_cluster_config
+from srtctl.core.config import get_srtslurm_setting, load_cluster_config
+from srtctl.core.git_state import GIT_STATE_FILENAME
 from srtctl.core.lockfile import collect_worker_fingerprints, generate_reproduction_report, write_lockfile
 from srtctl.core.schema import AIAnalysisConfig, S3Config
 from srtctl.core.slurm import start_srun_process
@@ -39,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 POSTPROCESS_PARSE_FAILED_EXIT = 20
 POSTPROCESS_UPLOAD_FAILED_EXIT = 11
+NODE_METRICS_EXPORT_TIMEOUT_SEC = 600
 
 
 class PostProcessStageMixin:
@@ -126,9 +129,15 @@ class PostProcessStageMixin:
         At submit time, config.yaml, sbatch_script.sh, and {job_id}.json are saved
         to outputs/{job_id}/, but S3 syncs outputs/{job_id}/logs/. This copies them
         into logs/ so they get uploaded alongside benchmark results and worker logs.
+
+        Override/zip submissions also write a resolved runtime config next to the
+        source as config_{suffix}.yaml (or config_resolved.yaml). Glob all
+        config*.yaml files so the actually-executed resolved config is uploaded
+        too, not just the unresolved source config.yaml.
         """
         output_dir = self.runtime.log_dir.parent
-        files_to_copy = ["config.yaml", "sbatch_script.sh", f"{self.runtime.job_id}.json"]
+        config_files = sorted(p.name for p in output_dir.glob("config*.yaml"))
+        files_to_copy = [*config_files, "sbatch_script.sh", f"{self.runtime.job_id}.json", GIT_STATE_FILENAME]
         for name in files_to_copy:
             src = output_dir / name
             if not src.exists():
@@ -189,6 +198,9 @@ class PostProcessStageMixin:
 
         # Compare against previous lockfile if this was a lockfile re-run
         self._compare_against_previous_lock()
+
+        # Export per-node batch CSVs + gen_throughput summary (optional)
+        self._export_node_metrics_csv()
 
         # Run srtlog + S3 upload in single container (if S3 configured)
         _parquet_path, s3_url = self._run_postprocess_container()
@@ -295,6 +307,93 @@ class PostProcessStageMixin:
         except Exception as e:
             logger.debug("Lockfile comparison skipped: %s", e)
 
+    def _build_node_metrics_export_script(self, run_path: str, srtctl_root: Path) -> str:
+        """Bash script: ``mktemp`` venv, ``pip install -r analysis/requirements.txt``, then ``-m`` export.
+
+        Dependencies install only inside the ephemeral venv (no ``uv pip install --system``).
+        ``PYTHONPATH`` is set to ``srtctl_root`` so ``analysis`` resolves to ``<root>/analysis/``.
+        """
+        requirements = srtctl_root / "analysis" / "requirements.txt"
+        q_root = shlex.quote(str(srtctl_root))
+        q_req = shlex.quote(str(requirements))
+        q_run = shlex.quote(run_path)
+        return f"""
+set -euo pipefail
+
+VENV_DIR=$(mktemp -d)
+cleanup() {{ rm -rf "$VENV_DIR"; }}
+trap cleanup EXIT
+
+python3 -m venv "$VENV_DIR"
+"$VENV_DIR/bin/pip" install -q -r {q_req}
+export PYTHONPATH={q_root}
+"$VENV_DIR/bin/python" -m analysis.srtlog.export_node_metrics {q_run}
+"""
+
+    def _export_node_metrics_csv(self) -> None:
+        """Export node batch metrics CSVs via ``analysis.srtlog.export_node_metrics``.
+
+        Controlled by ``benchmark.export_node_metrics``. Runs a **subprocess** whose bash
+        script creates a temporary venv, ``pip install -r <srtctl_root>/analysis/requirements.txt``,
+        then ``python -m analysis.srtlog.export_node_metrics <run_path>`` with ``PYTHONPATH``
+        set to ``srtctl_root`` from ``srtslurm.yaml``.
+
+        Writes under ``<job_output>/logs/node_metrics/`` (same layout as manual export).
+        """
+        if not self.config.benchmark.export_node_metrics:
+            return
+
+        srtctl_root = get_srtslurm_setting("srtctl_root")
+        if not srtctl_root:
+            logger.warning(
+                "benchmark.export_node_metrics is true but srtslurm.yaml has no srtctl_root; skipping CSV export"
+            )
+            return
+
+        root = Path(srtctl_root).resolve()
+        if not root.is_dir():
+            logger.warning("srtctl_root is not a directory (%s); skipping node metrics CSV export", root)
+            return
+
+        requirements = root / "analysis" / "requirements.txt"
+        if not requirements.is_file():
+            logger.warning("analysis/requirements.txt missing at %s; skipping node metrics CSV export", requirements)
+            return
+
+        run_path = self.runtime.log_dir.parent.resolve()
+        script = self._build_node_metrics_export_script(str(run_path), root)
+
+        try:
+            logger.info("Exporting node metrics CSVs in subprocess (run_path=%s)...", run_path)
+            result = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=NODE_METRICS_EXPORT_TIMEOUT_SEC,
+            )
+            if result.stdout:
+                for line in result.stdout.rstrip().splitlines():
+                    logger.info("%s", line)
+            if result.stderr:
+                for line in result.stderr.rstrip().splitlines():
+                    logger.warning("%s", line)
+            if result.returncode != 0:
+                logger.warning(
+                    "Node metrics CSV export subprocess failed (exit %d, run_path=%s)",
+                    result.returncode,
+                    run_path,
+                )
+            else:
+                logger.info("Node metrics CSV export subprocess finished (run_path=%s)", run_path)
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "Node metrics CSV export subprocess timed out after %d s (run_path=%s)",
+                NODE_METRICS_EXPORT_TIMEOUT_SEC,
+                run_path,
+            )
+        except Exception as e:
+            logger.warning("Node metrics CSV export error: %s", e)
+
     def _run_postprocess_container(self) -> tuple[Path | None, str | None]:
         """Run srtlog and upload entire log directory to S3.
 
@@ -343,6 +442,7 @@ class PostProcessStageMixin:
                 container_image="python:3.11",
                 container_mounts={self.runtime.log_dir: Path("/logs")},
                 env_to_set=env,
+                het_group=self.runtime.nodes.het_group_for(self.runtime.nodes.head),
             )
             proc.wait(timeout=600)  # 10 min timeout for install + parse + full sync
 
@@ -495,6 +595,7 @@ echo "AI analysis complete."
                 container_image="python:3.11",
                 container_mounts={self.runtime.log_dir: Path("/logs")},
                 env_to_set=env_to_set,
+                het_group=self.runtime.nodes.het_group_for(self.runtime.nodes.head),
             )
 
             # Wait for completion with timeout (15 minutes for install + analysis)

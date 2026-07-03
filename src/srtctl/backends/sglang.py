@@ -22,13 +22,54 @@ from typing import (
 from marshmallow import Schema
 from marshmallow_dataclass import dataclass
 
+from srtctl.ports import (
+    DYN_SYSTEM_PORT_BASE,
+    MOONCAKE_HTTP_METADATA_PORT,
+    MOONCAKE_MASTER_PORT,
+    SGLANG_DIST_INIT_PORT_BASE,
+)
+
 if TYPE_CHECKING:
     from srtctl.backends.base import SrunConfig
     from srtctl.core.runtime import RuntimeContext
-    from srtctl.core.topology import Endpoint, Process
+    from srtctl.core.topology import Endpoint, NodePortAllocator, Process
 
 # Type alias for worker modes
 WorkerMode = Literal["prefill", "decode", "agg"]
+
+
+@dataclass(frozen=True)
+class MooncakeKVStoreConfig:
+    """Mooncake KV store configuration.
+
+    When present, srtslurm launches mooncake_master on the infra node with
+    its embedded HTTP metadata server (so a separate metadata service is not
+    required), and injects on every worker:
+
+        MOONCAKE_MASTER              = <infra_ip>:8700
+        MOONCAKE_TE_META_DATA_SERVER = http://<infra_ip>:8701/metadata
+        MOONCAKE_LOCAL_HOSTNAME      = <worker_ip>
+
+    The HTTP metadata server is also what Dynamo's KV router calls into for
+    its `/batch_query_keys` shared-cache lookup path
+    (`lib/llm/src/kv_router/shared_cache.rs`), so enabling it here is what
+    lets `--shared-cache-type hicache` actually return non-zero hits.
+
+    Example YAML:
+        backend:
+          type: sglang
+          mooncake_kv_store:
+            container: nvcr.io/nvidia/mooncake:latest  # optional
+            env:
+              MOONCAKE_PROTOCOL: rdma
+              MOONCAKE_GLOBAL_SEGMENT_SIZE: "4gb"
+              MOONCAKE_DEVICE: mlx5_0
+    """
+
+    container: str | None = None
+    env: dict[str, str] = field(default_factory=dict)
+
+    Schema: ClassVar[type[Schema]] = Schema
 
 
 @dataclass(frozen=True)
@@ -82,6 +123,10 @@ class SGLangProtocol:
     # Or global: true (enables for prefill+decode with defaults)
     kv_events_config: bool | dict[str, Any] | None = None
 
+    # Mooncake KV store - launches mooncake_master on infra node and injects
+    # MOONCAKE_MASTER env var on all workers automatically
+    mooncake_kv_store: MooncakeKVStoreConfig | None = None
+
     Schema: ClassVar[builtins.type[Schema]] = Schema
 
     # =========================================================================
@@ -124,6 +169,31 @@ class SGLangProtocol:
         additional process-specific env vars are needed here.
         """
         return {}
+
+    def get_mooncake_worker_env(self, infra_node_ip: str, local_hostname: str) -> dict[str, str]:
+        """Get mooncake env vars to inject on a specific worker.
+
+        Returns empty dict if mooncake_kv_store is not configured. Otherwise:
+        - MOONCAKE_LOCAL_HOSTNAME defaults to the worker's resolved IP, but the
+          user can override it in mooncake_kv_store.env if they need something
+          custom (e.g. a specific RDMA NIC IP).
+        - MOONCAKE_MASTER and MOONCAKE_TE_META_DATA_SERVER are always set by
+          srtslurm to point at the infra-node mooncake_master, and override any
+          user-supplied value (the user can't know the infra IP at config time).
+
+        Args:
+            infra_node_ip: Resolved IP of the infra node where mooncake_master runs.
+            local_hostname: Resolved IP of the worker's own node, for peer-to-peer
+                transfers. Defaults to the worker's primary network interface IP.
+        """
+        if self.mooncake_kv_store is None:
+            return {}
+        return {
+            "MOONCAKE_LOCAL_HOSTNAME": local_hostname,
+            **self.mooncake_kv_store.env,
+            "MOONCAKE_MASTER": f"{infra_node_ip}:{MOONCAKE_MASTER_PORT}",
+            "MOONCAKE_TE_META_DATA_SERVER": (f"http://{infra_node_ip}:{MOONCAKE_HTTP_METADATA_PORT}/metadata"),
+        }
 
     def is_grpc_mode(self, mode: WorkerMode) -> bool:
         """Check if gRPC mode is enabled for a worker mode."""
@@ -179,6 +249,7 @@ class SGLangProtocol:
         gpus_per_agg: int,
         gpus_per_node: int,
         available_nodes: Sequence[str],
+        spread_workers: bool = False,
     ) -> list["Endpoint"]:
         """Allocate endpoints to nodes."""
         from srtctl.core.topology import allocate_endpoints
@@ -192,17 +263,19 @@ class SGLangProtocol:
             gpus_per_agg=gpus_per_agg,
             gpus_per_node=gpus_per_node,
             available_nodes=available_nodes,
+            spread_workers=spread_workers,
         )
 
     def endpoints_to_processes(
         self,
         endpoints: list["Endpoint"],
-        base_sys_port: int = 8081,
+        base_sys_port: int = DYN_SYSTEM_PORT_BASE,
+        port_allocator: "NodePortAllocator | None" = None,
     ) -> list["Process"]:
         """Convert endpoints to processes."""
         from srtctl.core.topology import endpoints_to_processes
 
-        return endpoints_to_processes(endpoints, base_sys_port=base_sys_port)
+        return endpoints_to_processes(endpoints, base_sys_port=base_sys_port, port_allocator=port_allocator)
 
     def build_worker_command(
         self,
@@ -240,7 +313,7 @@ class SGLangProtocol:
 
         # Get leader IP for distributed init
         leader_ip = get_hostname_ip(endpoint_nodes[0])
-        dist_init_port = 29500
+        dist_init_port = SGLANG_DIST_INIT_PORT_BASE
 
         # Choose Python module based on frontend type
         use_sglang = frontend_type == "sglang"
@@ -277,8 +350,12 @@ class SGLangProtocol:
         # Add disaggregation mode for prefill/decode workers (both dynamo and sglang frontend)
         if mode != "agg":
             cmd.extend(["--disaggregation-mode", mode])
-            # Bootstrap port only needed for sglang frontend (dynamo handles internally)
-            if frontend_type == "sglang" and mode == "prefill" and process.bootstrap_port is not None:
+            # Always pass bootstrap port for prefill workers regardless of frontend type.
+            # Dynamo does NOT handle this internally — SGLang's CommonKVBootstrapServer
+            # still runs on every prefill node for KV transfer coordination, and workers
+            # must register to it. Without an explicit port, the default (8998) collides
+            # with Dynamo services (etcd/NATS) on the head node, breaking multi-node prefill.
+            if mode == "prefill" and process.bootstrap_port is not None:
                 cmd.extend(["--disaggregation-bootstrap-port", str(process.bootstrap_port)])
 
         # Add multi-node coordination flags
