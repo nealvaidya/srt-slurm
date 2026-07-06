@@ -691,11 +691,20 @@ class TestS3UploadFaultTolerance:
         script = mixin._build_postprocess_script("s3://test-bucket/run/", "")
 
         parse_line = "srtlog parse . || PARSE_STATUS=$?"
-        upload_line = "aws s3 sync /logs s3://test-bucket/run/"
+        upload_line = 'aws s3 sync /logs s3://test-bucket/run/ --exclude "fpm/fpm.sock"'
 
         assert parse_line in script
         assert upload_line in script
         assert script.index(parse_line) < script.index(upload_line)
+
+    def test_postprocess_script_excludes_only_live_fpm_socket(self, tmp_path):
+        """FPM artifacts remain uploadable while the Unix socket is ignored."""
+        mixin = self._create_mixin_with_runtime(tmp_path)
+        script = mixin._build_postprocess_script("s3://test-bucket/run/", "")
+
+        assert '--exclude "fpm/fpm.sock"' in script
+        assert '--exclude "telemetry/*"' not in script
+        assert '--exclude "telemetry/final.parquet"' not in script
 
     def test_run_postprocess_completes_with_s3_failure(self, tmp_path):
         """Test run_postprocess completes even when S3 upload fails entirely."""
