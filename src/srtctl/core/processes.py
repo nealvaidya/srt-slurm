@@ -150,11 +150,22 @@ class ProcessRegistry:
 
             return len(self._failed_processes) > 0
 
-    def cleanup(self) -> None:
-        """Terminate all registered processes."""
+    def cleanup(self, *, exclude: set[str] | None = None) -> None:
+        """Terminate registered processes, optionally preserving named ones.
+
+        Preserving a process is useful when one service must outlive the rest
+        of the deployment for graceful finalization.  Tachometer, for example,
+        imports worker-produced FPM trace files only after the workers have
+        stopped.
+        """
+        excluded = exclude or set()
         with self._lock:
-            logger.info("Cleaning up %d processes...", len(self._processes))
+            cleanup_count = sum(name not in excluded for name in self._processes)
+            logger.info("Cleaning up %d processes...", cleanup_count)
             for name, proc in self._processes.items():
+                if name in excluded:
+                    logger.debug("Preserving process for later cleanup: %s", name)
+                    continue
                 if proc.is_running:
                     logger.debug("Terminating process: %s", name)
                     try:

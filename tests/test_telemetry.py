@@ -399,6 +399,72 @@ class TestTelemetryStageMixin:
         assert (tmp_path / "telemetry" / "fpm").is_dir()
         telemetry_proc = next(proc for proc in procs if proc.name == "telemetry")
         assert telemetry_proc.shutdown_timeout == 600.0
+        telemetry_call = mock_srun.call_args_list[2]
+        assert telemetry_call.kwargs["command"][:2] == ["sh", "-c"]
+        assert ".shutdown-requested" in telemetry_call.kwargs["command"][2]
+        assert "kill -TERM" in telemetry_call.kwargs["command"][2]
+
+    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    def test_finalize_telemetry_gracefully_imports_fpm_before_fallback(self, mock_srun, tmp_path):
+        harness = TelemetryStageMixin()
+        harness.config = _make_config(
+            telemetry=TelemetryConfig(
+                enabled=True,
+                container_image="telemetry:latest",
+                forward_pass_metrics=ForwardPassMetricsTelemetryConfig(enabled=True),
+                dcgm_exporter=TelemetryExporterConfig(container_image="dcgm:latest", port=9401),
+                node_exporter=TelemetryExporterConfig(container_image="node:latest", port=9101),
+            )
+        )
+        harness.runtime = MagicMock()
+        harness.runtime.log_dir = tmp_path
+        telemetry_dir = tmp_path / "telemetry"
+        telemetry_dir.mkdir()
+
+        popen = MagicMock()
+
+        def _finish_gracefully(*, timeout):
+            assert timeout == 600
+            assert (telemetry_dir / ".shutdown-requested").read_text() == "shutdown\n"
+            scraper_dir = telemetry_dir / "scraper"
+            scraper_dir.mkdir()
+            (scraper_dir / "final.parquet").write_bytes(b"combined-parquet")
+            (telemetry_dir / "fpm_manifest.json").write_text('{"complete": true, "received_events": 42}\n')
+            return 0
+
+        popen.wait.side_effect = _finish_gracefully
+        telemetry_proc = MagicMock(is_running=True, popen=popen)
+        registry = MagicMock()
+        registry.get_process.return_value = telemetry_proc
+
+        result = harness.finalize_telemetry(registry)
+
+        assert result == telemetry_dir / "scraper" / "final.parquet"
+        assert not (telemetry_dir / ".shutdown-requested").exists()
+        mock_srun.assert_not_called()
+
+    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    def test_finalize_telemetry_fpm_requires_manifest(self, mock_srun, tmp_path):
+        harness = TelemetryStageMixin()
+        harness.config = _make_config(
+            telemetry=TelemetryConfig(
+                enabled=True,
+                container_image="telemetry:latest",
+                forward_pass_metrics=ForwardPassMetricsTelemetryConfig(enabled=True),
+                dcgm_exporter=TelemetryExporterConfig(container_image="dcgm:latest", port=9401),
+                node_exporter=TelemetryExporterConfig(container_image="node:latest", port=9101),
+            )
+        )
+        harness.runtime = MagicMock()
+        harness.runtime.log_dir = tmp_path
+        telemetry_dir = tmp_path / "telemetry"
+        telemetry_dir.mkdir()
+        scraper_dir = telemetry_dir / "scraper"
+        scraper_dir.mkdir()
+        (scraper_dir / "final.parquet").write_bytes(b"metrics-only")
+
+        assert harness.finalize_telemetry() is None
+        mock_srun.assert_not_called()
 
     def test_trace_producer_ids_deduplicate_rotated_segments(self, tmp_path):
         trace_dir = tmp_path / "fpm"

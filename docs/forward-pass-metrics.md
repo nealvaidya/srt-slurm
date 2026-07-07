@@ -38,7 +38,14 @@ SRT then:
 - imports all completed segments into Tachometer after workers stop and before
   Tachometer compacts its dataset.
 
-The resulting `telemetry/final.parquet` contains `dynamo_fpm_*` scalar metrics.
+During cleanup, SRT preserves the Tachometer process while stopping the serving
+workers and exporters. It then writes a shutdown sentinel in the shared
+telemetry directory; Tachometer's in-container wrapper converts that sentinel
+to `SIGTERM` for the real scraper process. This avoids relying on the local
+`srun` client's signal forwarding and preserves the scraper's original clock
+origin for FPM timestamps.
+
+The resulting `telemetry/scraper/final.parquet` contains `dynamo_fpm_*` scalar metrics.
 Useful join and integrity columns include `worker_role`, `worker_id`, `dp_rank`,
 `fpm_counter_id`, `fpm_producer_id`, and `fpm_capture_mode`. Shutdown also
 writes `telemetry/fpm_manifest.json` with source files, worker and producer

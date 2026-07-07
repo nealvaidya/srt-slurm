@@ -449,6 +449,10 @@ class SweepOrchestrator(
         finally:
             logger.info("Cleanup")
             stop_event.set()
+            # Tachometer must outlive workers/exporters so its graceful
+            # shutdown can import the completed Dynamo FPM trace segments.
+            registry.cleanup(exclude={"telemetry"})
+            self.finalize_telemetry(registry)
             registry.cleanup()
             if exit_code != 0:
                 registry.print_failure_details()
