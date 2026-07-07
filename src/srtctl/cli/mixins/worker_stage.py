@@ -121,6 +121,30 @@ class WorkerStageMixin:
             env_to_set.setdefault("DYN_KVBM_LEADER_ZMQ_PUB_PORT", str(pub_port))
             env_to_set.setdefault("DYN_KVBM_LEADER_ZMQ_ACK_PORT", str(ack_port))
 
+    def _apply_fpm_trace_env(self, env_to_set: dict[str, str], process: "Process") -> None:
+        """Configure Dynamo's producer-side FPM trace for one worker process."""
+        telemetry = getattr(self.config, "telemetry", None)
+        if telemetry is None:
+            return
+        fpm = telemetry.forward_pass_metrics
+        if getattr(fpm, "enabled", False) is not True:
+            return
+        if process.fpm_port is None:
+            raise ValueError("FPM enabled but no worker FPM port was allocated")
+
+        env_to_set.update(
+            {
+                "DYN_EVENT_PLANE": "zmq",
+                "DYN_FORWARDPASS_METRIC_PORT": str(process.fpm_port),
+                "DYN_FPM_TRACE": "1",
+                "DYN_FPM_MODE": fpm.mode.lower(),
+                "DYN_FPM_SAMPLE_INTERVAL_MS": str(fpm.sample_interval_ms),
+                "DYN_FPM_JSONL_GZ_ROLL_BYTES": str(fpm.jsonl_gz_roll_bytes),
+                "DYN_FPM_MAX_SEGMENTS": str(fpm.max_segments),
+                "DYN_FPM_OUTPUT_PATH": f"/logs/{telemetry.storage_subdir}/fpm/dynamo-fpm",
+            }
+        )
+
     def start_worker(self, process: "Process", endpoint_processes: list["Process"]) -> ManagedProcess:
         """Start a single worker process (one srun per node, used by SGLang)."""
         mode = process.endpoint_mode
@@ -199,16 +223,9 @@ class WorkerStageMixin:
         # Add backend-specific process environment variables (e.g., unique ports)
         env_to_set.update(self.backend.get_process_environment(process))
 
-        # FPM collection is explicitly bound to Dynamo's ZMQ event plane. Keep
-        # these values authoritative even if a generic recipe environment block
-        # contains stale event-plane settings.
-        telemetry = getattr(self.config, "telemetry", None)
-        fpm = getattr(telemetry, "forward_pass_metrics", None)
-        if getattr(fpm, "enabled", False) is True:
-            if process.fpm_port is None:
-                raise ValueError("FPM enabled but no worker FPM port was allocated")
-            env_to_set["DYN_EVENT_PLANE"] = "zmq"
-            env_to_set["DYN_FORWARDPASS_METRIC_PORT"] = str(process.fpm_port)
+        # Keep trace and transport settings authoritative over generic recipe
+        # environment values.
+        self._apply_fpm_trace_env(env_to_set, process)
 
         # Add mooncake worker env vars if configured (SGLang only). Resolve the
         # worker's own IP so MOONCAKE_LOCAL_HOSTNAME is correct for multi-node
@@ -342,6 +359,7 @@ class WorkerStageMixin:
             local_hostname = get_hostname_ip(leader.node, self.runtime.network_interface)
             env_to_set.update(self.backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname))
 
+        self._apply_fpm_trace_env(env_to_set, leader)
         self._apply_kvbm_endpoint_env(env_to_set, endpoint_processes)
 
         # Log env vars in the format: VAR=value VAR2=value2

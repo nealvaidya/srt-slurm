@@ -500,10 +500,7 @@ cat > /logs/postprocess-status.json <<EOF
 EOF
 
 echo "Uploading entire log directory to S3..."
-# The live FPM transport is a Unix-domain socket, not an artifact.  aws s3
-# sync otherwise uploads every regular file successfully but exits 2 after
-# skipping the socket, which makes a complete upload look like a failure.
-aws s3 sync /logs {s3_url} --exclude "fpm/fpm.sock" {endpoint_flag} || UPLOAD_STATUS=$?
+aws s3 sync /logs {s3_url} {endpoint_flag} || UPLOAD_STATUS=$?
 
 if [ "$UPLOAD_STATUS" -ne 0 ]; then
   echo "Upload failed with status $UPLOAD_STATUS"
