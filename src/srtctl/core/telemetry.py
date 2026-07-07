@@ -137,8 +137,7 @@ def generate_telemetry_config(
         metadata = {"job_id": runtime.job_id, "run_name": runtime.run_name}
         metadata.update(telemetry.extra_metadata)
         fpm_config = {
-            "socket_path": "/fpm/fpm.sock",
-            "ready_path": f"/logs/{telemetry.storage_subdir}/fpm.ready",
+            "trace_path": f"/logs/{telemetry.storage_subdir}/fpm/dynamo-fpm",
             "manifest_path": f"/logs/{telemetry.storage_subdir}/fpm_manifest.json",
             "expected_workers": expected_workers,
             "component_roles": component_roles,
@@ -175,8 +174,7 @@ def _dump_toml(*, endpoints: list[TelemetryEndpoint], storage: str, fpm: dict[st
 
     if fpm is not None:
         lines.append("[fpm]")
-        lines.append(f"socket_path = {json.dumps(fpm['socket_path'])}")
-        lines.append(f"ready_path = {json.dumps(fpm['ready_path'])}")
+        lines.append(f"trace_path = {json.dumps(fpm['trace_path'])}")
         lines.append(f"manifest_path = {json.dumps(fpm['manifest_path'])}")
         for table in ("expected_workers", "component_roles", "metadata"):
             values = fpm[table]

@@ -32,6 +32,7 @@ class ManagedProcess:
         log_file: Path to the process log file
         node: Node hostname where the process runs
         critical: If True, failure triggers full cleanup
+        shutdown_timeout: Seconds to wait after SIGTERM before forcing SIGKILL
     """
 
     name: str
@@ -39,6 +40,7 @@ class ManagedProcess:
     log_file: Path | None = None
     node: str | None = None
     critical: bool = True
+    shutdown_timeout: float = 10.0
 
     @property
     def is_running(self) -> bool:
@@ -50,11 +52,12 @@ class ManagedProcess:
         """Get exit code if process has exited, None otherwise."""
         return self.popen.poll()
 
-    def terminate(self, timeout: float = 10.0) -> None:
+    def terminate(self, timeout: float | None = None) -> None:
         """Terminate the process gracefully, then kill if needed."""
         if not self.is_running:
             return
 
+        timeout = self.shutdown_timeout if timeout is None else timeout
         self.popen.terminate()
         try:
             self.popen.wait(timeout=timeout)
@@ -123,6 +126,7 @@ class ProcessRegistry:
                     log_file=proc.log_file,
                     node=proc.node,
                     critical=proc.critical,
+                    shutdown_timeout=proc.shutdown_timeout,
                 )
             self.add_process(proc)
 

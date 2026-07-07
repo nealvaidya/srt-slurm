@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import shlex
 import threading
@@ -73,44 +74,37 @@ class TelemetryStageMixin:
             node=",".join(nodelist),
         )
 
-    def _build_dynamo_preamble(self) -> str | None:
-        """Build the same setup/install preamble used by Dynamo workers."""
-        parts = []
-        if self.config.setup_script:
-            script_path = f"/configs/{self.config.setup_script}"
-            parts.append(
-                f"echo 'Running setup script: {script_path}' && "
-                f"if [ -f '{script_path}' ]; then bash '{script_path}'; else echo 'WARNING: {script_path} not found'; fi"
-            )
-        if self.config.dynamo.install:
-            parts.append(self.config.dynamo.get_install_commands())
-        return " && ".join(parts) if parts else None
-
-    def _fpm_components(self) -> list[str]:
-        modes = {process.endpoint_mode for process in self.backend_processes}
-        components = []
-        if "prefill" in modes:
-            components.append("prefill")
-        if modes & {"decode", "agg"}:
-            components.append("backend")
-        return components
-
     def wait_for_telemetry_ready(
         self,
         registry: ProcessRegistry,
         stop_event: threading.Event,
     ) -> bool:
-        """Wait until Tachometer has stored a heartbeat from every FPM worker."""
+        """Wait until every expected Dynamo producer has opened a trace file."""
         fpm = self.config.telemetry.forward_pass_metrics
         if not fpm.enabled:
             return True
 
-        ready_path = self.runtime.log_dir / self.config.telemetry.storage_subdir / "fpm.ready"
+        telemetry_dir = self.runtime.log_dir / self.config.telemetry.storage_subdir
+        trace_dir = telemetry_dir / "fpm"
+        ready_path = telemetry_dir / "fpm.ready"
+        expected_producers = sum(process.fpm_publisher for process in self.backend_processes)
         deadline = time.monotonic() + fpm.ready_timeout_secs
-        logger.info("Waiting for Dynamo forward-pass metrics at %s", ready_path)
+        logger.info("Waiting for %d Dynamo FPM trace producer(s) under %s", expected_producers, trace_dir)
         while time.monotonic() < deadline and not stop_event.is_set():
-            if ready_path.exists():
-                logger.info("Dynamo forward-pass metrics are ready")
+            producer_ids = _trace_producer_ids(trace_dir)
+            if len(producer_ids) >= expected_producers:
+                ready_path.write_text(
+                    json.dumps(
+                        {
+                            "ready": True,
+                            "expected_producers": expected_producers,
+                            "producer_ids": sorted(producer_ids),
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                )
+                logger.info("Dynamo FPM tracing is ready for %d producer(s)", len(producer_ids))
                 return True
             if registry.check_failures():
                 logger.error("A critical process failed while waiting for FPM readiness")
@@ -118,7 +112,7 @@ class TelemetryStageMixin:
             time.sleep(1)
 
         logger.error(
-            "Dynamo forward-pass metrics did not become ready within %ss",
+            "Dynamo FPM trace producers did not become ready within %ss",
             fpm.ready_timeout_secs,
         )
         return False
@@ -149,15 +143,9 @@ class TelemetryStageMixin:
         telemetry_dir.mkdir(parents=True, exist_ok=True)
         local_dir = telemetry_dir / "local"
         local_dir.mkdir(parents=True, exist_ok=True)
-        fpm_socket_dir: Path | None = None
         if telemetry.forward_pass_metrics.enabled:
-            fpm_socket_dir = Path(f"/tmp/srtctl-fpm-{self.runtime.job_id}")
-            fpm_socket_dir.mkdir(parents=True, exist_ok=True)
-            for stale_path in (
-                fpm_socket_dir / "fpm.sock",
-                telemetry_dir / "fpm.ready",
-                telemetry_dir / "fpm_manifest.json",
-            ):
+            (telemetry_dir / "fpm").mkdir(parents=True, exist_ok=True)
+            for stale_path in (telemetry_dir / "fpm.ready", telemetry_dir / "fpm_manifest.json"):
                 stale_path.unlink(missing_ok=True)
 
         worker_nodes = sorted({process.node for process in self.backend_processes})
@@ -201,8 +189,6 @@ class TelemetryStageMixin:
         scraper_mounts = self.runtime.container_mounts | {
             config_path: Path("/telemetry_config.toml"),
         }
-        if fpm_socket_dir is not None:
-            scraper_mounts[fpm_socket_dir] = Path("/fpm")
         processes.append(
             ManagedProcess(
                 name="telemetry",
@@ -217,51 +203,19 @@ class TelemetryStageMixin:
                 ),
                 log_file=self.runtime.log_dir / "telemetry.out",
                 node=self.runtime.nodes.head,
+                shutdown_timeout=600.0,
             )
         )
-
-        if telemetry.forward_pass_metrics.enabled:
-            assert fpm_socket_dir is not None
-            fpm = telemetry.forward_pass_metrics
-            fpm_cmd = [
-                "python3",
-                "-m",
-                "dynamo.common.export_forward_pass_metrics",
-                "--namespace",
-                fpm.namespace,
-                "--socket",
-                "/fpm/fpm.sock",
-                "--connect-timeout",
-                str(fpm.connect_timeout_secs),
-            ]
-            for component in self._fpm_components():
-                fpm_cmd.extend(["--component", component])
-            fpm_mounts = self.runtime.container_mounts | {
-                fpm_socket_dir: Path("/fpm"),
-            }
-            processes.append(
-                ManagedProcess(
-                    name="telemetry_fpm_exporter",
-                    popen=start_srun_process(
-                        command=fpm_cmd,
-                        nodelist=[self.runtime.nodes.head],
-                        output=str(self.runtime.log_dir / "telemetry_fpm_exporter.out"),
-                        container_image=str(self.runtime.container_image),
-                        container_mounts=fpm_mounts,
-                        env_to_set={
-                            "ETCD_ENDPOINTS": f"http://{self.runtime.nodes.infra}:2379",
-                            "DYN_DISCOVERY_BACKEND": "etcd",
-                            "DYN_EVENT_PLANE": "zmq",
-                            "DYN_REQUEST_PLANE": "tcp",
-                            "DYN_SYSTEM_PORT": str(max(process.sys_port for process in self.backend_processes) + 1000),
-                        },
-                        bash_preamble=self._build_dynamo_preamble(),
-                        srun_options=self.runtime.srun_options,
-                    ),
-                    log_file=self.runtime.log_dir / "telemetry_fpm_exporter.out",
-                    node=self.runtime.nodes.head,
-                    critical=True,
-                )
-            )
         logger.info("Telemetry started with artifacts under %s", telemetry_dir)
         return processes
+
+
+def _trace_producer_ids(trace_dir: Path) -> set[str]:
+    """Return producer IDs represented by Dynamo's trace segment filenames."""
+    producer_ids = set()
+    for path in trace_dir.glob("dynamo-fpm.*.jsonl.gz"):
+        remainder = path.name.removeprefix("dynamo-fpm.").removesuffix(".jsonl.gz")
+        producer_id, separator, segment = remainder.rpartition(".")
+        if separator and producer_id and segment.isdigit():
+            producer_ids.add(producer_id)
+    return producer_ids

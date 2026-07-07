@@ -244,6 +244,11 @@ class TestDryRunExecutionExtensions:
                     "container_image": "telemetry:latest",
                     "dcgm_exporter": {"container_image": "dcgm:latest", "port": 9401},
                     "node_exporter": {"container_image": "node:latest", "port": 9101},
+                    "forward_pass_metrics": {
+                        "enabled": True,
+                        "mode": "full",
+                        "max_segments": 64,
+                    },
                 }
             }
         )
@@ -252,3 +257,6 @@ class TestDryRunExecutionExtensions:
         assert "telemetry" in output
         assert "scraper" in output
         assert "storage_subdir" in output
+        assert "telemetry.fpm" in output
+        assert "max_segments" in output
+        assert "64" in output

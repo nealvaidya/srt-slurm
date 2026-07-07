@@ -281,6 +281,12 @@ def show_config_details(config: SrtConfig) -> None:
             details.add_row("telemetry", "container_image", config.telemetry.container_image or "<unset>")
             details.add_row("telemetry", "storage_subdir", config.telemetry.storage_subdir)
             details.add_row("telemetry", "frequency", str(config.telemetry.default_frequency))
+            fpm = config.telemetry.forward_pass_metrics
+            if fpm.enabled:
+                details.add_row("telemetry.fpm", "mode", fpm.mode)
+                details.add_row("telemetry.fpm", "sample_interval_ms", str(fpm.sample_interval_ms))
+                details.add_row("telemetry.fpm", "jsonl_gz_roll_bytes", str(fpm.jsonl_gz_roll_bytes))
+                details.add_row("telemetry.fpm", "max_segments", str(fpm.max_segments))
 
         console.print(Panel(details, border_style="blue"))
 

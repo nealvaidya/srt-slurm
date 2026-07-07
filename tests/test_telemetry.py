@@ -3,6 +3,7 @@
 
 """Tests for telemetry configuration and startup."""
 
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -10,7 +11,8 @@ import pytest
 from marshmallow import ValidationError
 
 from srtctl.cli.mixins.frontend_stage import FrontendTopology
-from srtctl.cli.mixins.telemetry_stage import TelemetryStageMixin
+from srtctl.cli.mixins.telemetry_stage import TelemetryStageMixin, _trace_producer_ids
+from srtctl.cli.mixins.worker_stage import WorkerStageMixin
 from srtctl.core.schema import (
     BenchmarkConfig,
     ForwardPassMetricsTelemetryConfig,
@@ -51,6 +53,18 @@ class TestTelemetryConfig:
         with pytest.raises(ValidationError, match="telemetry.enabled=true"):
             _make_config(
                 telemetry=TelemetryConfig(forward_pass_metrics=ForwardPassMetricsTelemetryConfig(enabled=True))
+            )
+
+    def test_forward_pass_metrics_rejects_invalid_trace_mode(self):
+        with pytest.raises(ValidationError, match="mode must be full or sampled"):
+            _make_config(
+                telemetry=TelemetryConfig(
+                    enabled=True,
+                    container_image="telemetry:latest",
+                    dcgm_exporter=TelemetryExporterConfig(container_image="dcgm:latest", port=9401),
+                    node_exporter=TelemetryExporterConfig(container_image="node:latest", port=9101),
+                    forward_pass_metrics=ForwardPassMetricsTelemetryConfig(enabled=True, mode="latest"),
+                )
             )
 
 
@@ -160,7 +174,7 @@ class TestTelemetryConfigGeneration:
         )
 
         assert "[fpm]" in config_text
-        assert 'socket_path = "/fpm/fpm.sock"' in config_text
+        assert 'trace_path = "/logs/telemetry/fpm/dynamo-fpm"' in config_text
         assert "[fpm.expected_workers]" in config_text
         assert '"prefill" = 1' in config_text
         assert '"backend" = 1' in config_text
@@ -226,7 +240,7 @@ class TestTelemetryStageMixin:
 
     @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
     @patch("srtctl.cli.mixins.telemetry_stage.generate_telemetry_config", return_value='storage = "/logs/telemetry"\n')
-    def test_start_telemetry_starts_dynamo_fpm_exporter(self, _mock_config, mock_srun, tmp_path):
+    def test_start_telemetry_uses_producer_traces_without_sidecar(self, _mock_config, mock_srun, tmp_path):
         class Harness(TelemetryStageMixin):
             def __init__(self):
                 self.config = _make_config(
@@ -273,9 +287,95 @@ class TestTelemetryStageMixin:
 
         procs = Harness().start_telemetry()
 
-        assert len(procs) == 4
-        fpm_call = mock_srun.call_args_list[-1].kwargs
-        assert fpm_call["command"][-2:] == ["--component", "backend"]
-        assert fpm_call["env_to_set"]["DYN_EVENT_PLANE"] == "zmq"
-        assert fpm_call["env_to_set"]["DYN_REQUEST_PLANE"] == "tcp"
-        assert "NATS_SERVER" not in fpm_call["env_to_set"]
+        assert len(procs) == 3
+        assert mock_srun.call_count == 3
+        assert (tmp_path / "telemetry" / "fpm").is_dir()
+        telemetry_proc = next(proc for proc in procs if proc.name == "telemetry")
+        assert telemetry_proc.shutdown_timeout == 600.0
+
+    def test_trace_producer_ids_deduplicate_rotated_segments(self, tmp_path):
+        trace_dir = tmp_path / "fpm"
+        trace_dir.mkdir()
+        for name in (
+            "dynamo-fpm.worker-a.000000.jsonl.gz",
+            "dynamo-fpm.worker-a.000001.jsonl.gz",
+            "dynamo-fpm.worker_b.000000.jsonl.gz",
+            "other.jsonl.gz",
+        ):
+            (trace_dir / name).touch()
+
+        assert _trace_producer_ids(trace_dir) == {"worker-a", "worker_b"}
+
+    def test_wait_for_telemetry_ready_uses_trace_producer_files(self, tmp_path):
+        class Harness(TelemetryStageMixin):
+            def __init__(self):
+                self.config = _make_config(
+                    telemetry=TelemetryConfig(
+                        enabled=True,
+                        container_image="telemetry:latest",
+                        forward_pass_metrics=ForwardPassMetricsTelemetryConfig(
+                            enabled=True,
+                            ready_timeout_secs=1,
+                        ),
+                        dcgm_exporter=TelemetryExporterConfig(container_image="dcgm:latest", port=9401),
+                        node_exporter=TelemetryExporterConfig(container_image="node:latest", port=9101),
+                    )
+                )
+                self.runtime = MagicMock(log_dir=tmp_path)
+                self._backend_processes = [
+                    Process(
+                        node="node-a",
+                        gpu_indices=frozenset({0}),
+                        sys_port=8081,
+                        http_port=30000,
+                        endpoint_mode="agg",
+                        endpoint_index=0,
+                        fpm_publisher=True,
+                    )
+                ]
+
+            @property
+            def backend_processes(self):
+                return self._backend_processes
+
+        trace_dir = tmp_path / "telemetry" / "fpm"
+        trace_dir.mkdir(parents=True)
+        (trace_dir / "dynamo-fpm.worker-a.000000.jsonl.gz").touch()
+        registry = MagicMock()
+
+        assert Harness().wait_for_telemetry_ready(registry, threading.Event())
+        ready = (tmp_path / "telemetry" / "fpm.ready").read_text()
+        assert '"expected_producers": 1' in ready
+        assert '"worker-a"' in ready
+
+
+class TestFpmWorkerEnvironment:
+    def test_applies_official_dynamo_trace_settings(self):
+        telemetry = TelemetryConfig(
+            enabled=True,
+            container_image="telemetry:latest",
+            storage_subdir="telemetry",
+            dcgm_exporter=TelemetryExporterConfig(container_image="dcgm:latest", port=9401),
+            node_exporter=TelemetryExporterConfig(container_image="node:latest", port=9101),
+            forward_pass_metrics=ForwardPassMetricsTelemetryConfig(
+                enabled=True,
+                mode="full",
+                sample_interval_ms=1_000,
+                jsonl_gz_roll_bytes=4_096,
+                max_segments=12,
+            ),
+        )
+        mixin = WorkerStageMixin()
+        mixin.config = _make_config(telemetry=telemetry)
+        env = {"DYN_EVENT_PLANE": "nats", "DYN_FPM_MODE": "sampled"}
+
+        mixin._apply_fpm_trace_env(env, MagicMock(fpm_port=20_380))
+
+        assert env["DYN_EVENT_PLANE"] == "zmq"
+        assert env["DYN_FORWARDPASS_METRIC_PORT"] == "20380"
+        assert env["DYN_FPM_TRACE"] == "1"
+        assert env["DYN_FPM_MODE"] == "full"
+        assert env["DYN_FPM_SAMPLE_INTERVAL_MS"] == "1000"
+        assert env["DYN_FPM_JSONL_GZ_ROLL_BYTES"] == "4096"
+        assert env["DYN_FPM_MAX_SEGMENTS"] == "12"
+        assert env["DYN_FPM_OUTPUT_PATH"] == "/logs/telemetry/fpm/dynamo-fpm"
