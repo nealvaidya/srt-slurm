@@ -141,3 +141,23 @@ class TestProcessRegistry:
         registry.cleanup()
 
         mock_popen.terminate.assert_called_once()
+
+    def test_cleanup_can_preserve_named_process(self):
+        """A finalizer can keep telemetry alive while workers stop."""
+        registry = ProcessRegistry(job_id="test_job")
+        worker_popen = MagicMock(spec=Popen)
+        worker_popen.poll.return_value = None
+        worker_popen.wait.return_value = 0
+        worker_popen.pid = 12345
+        telemetry_popen = MagicMock(spec=Popen)
+        telemetry_popen.poll.return_value = None
+        telemetry_popen.wait.return_value = 0
+        telemetry_popen.pid = 12346
+
+        registry.add_process(ManagedProcess(name="worker_0", popen=worker_popen))
+        registry.add_process(ManagedProcess(name="telemetry", popen=telemetry_popen))
+
+        registry.cleanup(exclude={"telemetry"})
+
+        worker_popen.terminate.assert_called_once()
+        telemetry_popen.terminate.assert_not_called()

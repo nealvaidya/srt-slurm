@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 TELEMETRY_FINALIZE_TIMEOUT_SECS = 300
+TELEMETRY_GRACEFUL_SHUTDOWN_TIMEOUT_SECS = 600
+TELEMETRY_SHUTDOWN_REQUEST = ".shutdown-requested"
 
 
 class TelemetryStageMixin:
@@ -176,6 +178,7 @@ class TelemetryStageMixin:
         telemetry_dir.mkdir(parents=True, exist_ok=True)
         local_dir = telemetry_dir / "local"
         local_dir.mkdir(parents=True, exist_ok=True)
+        (telemetry_dir / TELEMETRY_SHUTDOWN_REQUEST).unlink(missing_ok=True)
         if telemetry.forward_pass_metrics.enabled:
             (telemetry_dir / "fpm").mkdir(parents=True, exist_ok=True)
             for stale_path in (telemetry_dir / "fpm.ready", telemetry_dir / "fpm_manifest.json"):
@@ -205,7 +208,7 @@ class TelemetryStageMixin:
             )
         )
 
-        cmd = [
+        scraper_cmd = [
             telemetry.binary_path,
             "--config",
             "/telemetry_config.toml",
@@ -213,7 +216,38 @@ class TelemetryStageMixin:
             f"/logs/{telemetry.storage_subdir}/local",
         ]
         if telemetry.sync_interval_secs > 0:
-            cmd.extend(["--sync-interval", str(telemetry.sync_interval_secs)])
+            scraper_cmd.extend(["--sync-interval", str(telemetry.sync_interval_secs)])
+
+        # The local srun client does not reliably forward SIGTERM to the
+        # container task.  Run the scraper behind an in-container watcher so
+        # finalize_telemetry can request shutdown through the shared log
+        # directory.  The watcher signals the real Tachometer PID in the same
+        # namespace, allowing its FPM import and compaction handler to finish.
+        container_shutdown_path = f"/logs/{telemetry.storage_subdir}/{TELEMETRY_SHUTDOWN_REQUEST}"
+        scraper_script = "\n".join(
+            [
+                "set -u",
+                f"shutdown_request={shlex.quote(container_shutdown_path)}",
+                'rm -f "$shutdown_request"',
+                f"{shlex.join(scraper_cmd)} &",
+                "scraper_pid=$!",
+                "(",
+                '  while kill -0 "$scraper_pid" 2>/dev/null; do',
+                '    if [ -f "$shutdown_request" ]; then',
+                '      kill -TERM "$scraper_pid" 2>/dev/null || true',
+                "      exit 0",
+                "    fi",
+                "    sleep 0.2",
+                "  done",
+                ") &",
+                "watcher_pid=$!",
+                'wait "$scraper_pid"',
+                "status=$?",
+                'kill "$watcher_pid" 2>/dev/null || true',
+                'wait "$watcher_pid" 2>/dev/null || true',
+                'exit "$status"',
+            ]
+        )
 
         env_to_set: dict[str, str] = {}
         if telemetry.compaction_threads > 0:
@@ -226,7 +260,7 @@ class TelemetryStageMixin:
             ManagedProcess(
                 name="telemetry",
                 popen=start_srun_process(
-                    command=cmd,
+                    command=["sh", "-c", scraper_script],
                     nodelist=[self.runtime.nodes.head],
                     output=str(self.runtime.log_dir / "telemetry.out"),
                     container_image=telemetry.container_image,
@@ -243,13 +277,17 @@ class TelemetryStageMixin:
         logger.info("Telemetry started with artifacts under %s", telemetry_dir)
         return processes
 
-    def finalize_telemetry(self) -> Path | None:
+    def finalize_telemetry(self, registry: ProcessRegistry | None = None) -> Path | None:
         """Ensure a final telemetry parquet exists before post-processing.
 
-        Generic process cleanup terminates the local ``srun`` client, which
-        may kill the remote scraper before Tachometer can finish its signal
-        handler.  Recover from the durable Arrow/parquet checkpoints with the
-        scraper's own compact command before the log directory is uploaded.
+        When the scraper is still registered, request graceful shutdown through
+        its shared sentinel before falling back to checkpoint compaction.  The
+        scraper wrapper translates the sentinel into SIGTERM inside the
+        container, so Tachometer can import completed FPM trace segments, write
+        ``fpm_manifest.json``, and preserve its original timestamp origin.
+
+        Generic checkpoint compaction remains a recovery path for telemetry
+        runs without FPM, or when the scraper already exited unexpectedly.
         """
         telemetry = self.config.telemetry
         if not telemetry.enabled or telemetry.container_image is None:
@@ -257,8 +295,41 @@ class TelemetryStageMixin:
 
         telemetry_dir = self.runtime.log_dir / telemetry.storage_subdir
         final_path = telemetry_dir / "final.parquet"
-        if final_path.exists():
-            logger.info("Telemetry final parquet already exists: %s", final_path)
+        manifest_path = telemetry_dir / "fpm_manifest.json"
+        fpm_enabled = telemetry.forward_pass_metrics.enabled
+
+        telemetry_proc = registry.get_process("telemetry") if registry is not None else None
+        if telemetry_proc is not None and telemetry_proc.is_running:
+            shutdown_path = telemetry_dir / TELEMETRY_SHUTDOWN_REQUEST
+            logger.info("Requesting graceful telemetry shutdown through %s", shutdown_path)
+            shutdown_path.write_text("shutdown\n")
+            try:
+                return_code = telemetry_proc.popen.wait(timeout=TELEMETRY_GRACEFUL_SHUTDOWN_TIMEOUT_SECS)
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "Telemetry graceful shutdown timed out after %ss",
+                    TELEMETRY_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+                )
+            except Exception as exc:
+                logger.warning("Telemetry graceful shutdown failed: %s", exc)
+            else:
+                if return_code != 0:
+                    logger.warning("Telemetry scraper exited with code %s during graceful shutdown", return_code)
+                elif self._telemetry_outputs_complete(final_path, manifest_path, fpm_enabled):
+                    logger.info("Telemetry graceful finalization complete: %s", final_path)
+                    return final_path
+            finally:
+                shutdown_path.unlink(missing_ok=True)
+
+            if telemetry_proc.is_running:
+                logger.warning("Forcing unresponsive telemetry step down before checkpoint recovery")
+                try:
+                    telemetry_proc.terminate(timeout=10)
+                except Exception as exc:
+                    logger.warning("Unable to terminate telemetry step before recovery: %s", exc)
+
+        if self._telemetry_outputs_complete(final_path, manifest_path, fpm_enabled):
+            logger.info("Telemetry final outputs already exist: %s", final_path)
             return final_path
 
         local_dir = telemetry_dir / "local"
@@ -268,6 +339,12 @@ class TelemetryStageMixin:
         if not any(path.is_file() for path in checkpoint_files):
             logger.warning("Telemetry finalization skipped: no checkpoints under %s", local_dir)
             return None
+
+        if fpm_enabled:
+            logger.warning(
+                "Telemetry scraper did not complete graceful FPM finalization; "
+                "checkpoint compaction cannot import FPM traces"
+            )
 
         container_local_dir = f"/logs/{telemetry.storage_subdir}/local"
         container_output = f"file:///logs/{telemetry.storage_subdir}"
@@ -321,6 +398,22 @@ class TelemetryStageMixin:
 
         logger.info("Telemetry finalization complete: %s", final_path)
         return final_path
+
+    @staticmethod
+    def _telemetry_outputs_complete(final_path: Path, manifest_path: Path, fpm_enabled: bool) -> bool:
+        """Return whether the expected durable telemetry outputs are present."""
+        if not final_path.is_file():
+            return False
+        if not fpm_enabled:
+            return True
+        if not manifest_path.is_file():
+            return False
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return False
+        received_events = manifest.get("received_events")
+        return manifest.get("complete") is True and type(received_events) is int and received_events > 0
 
 
 def _trace_producer_ids(trace_dir: Path) -> set[str]:
