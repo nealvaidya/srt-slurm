@@ -140,6 +140,34 @@ class VLLMProtocol:
             env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(process.nixl_port)
         return env
 
+    def build_kv_event_publisher_args(self, process: Process, topic: str = "") -> list[str]:
+        """Build vLLM's native KV-event publisher arguments for one process.
+
+        vLLM offsets the configured endpoint by its data-parallel rank. SRT
+        allocates the final externally visible port, so DP ranks receive a
+        correspondingly lower base port.
+        """
+        if not process.kv_events_publisher:
+            return []
+        if process.kv_events_port is None:
+            raise ValueError("KV-cache event recording enabled but no worker KV-event port was allocated")
+
+        config = self.get_config_for_mode(process.endpoint_mode)
+        if "kv-events-config" in config or "kv_events_config" in config:
+            raise ValueError("telemetry.kv_cache_events cannot be combined with a user-provided vLLM kv-events-config")
+
+        dp_rank = process.node_rank if self._is_dp_mode(process.endpoint_mode) else 0
+        base_port = process.kv_events_port - dp_rank
+        if base_port <= 0:
+            raise ValueError(f"Invalid vLLM KV-event base port: {base_port}")
+        publisher_config = {
+            "enable_kv_cache_events": True,
+            "publisher": "zmq",
+            "endpoint": f"tcp://*:{base_port}",
+            "topic": topic,
+        }
+        return ["--kv-events-config", json.dumps(publisher_config, separators=(",", ":"))]
+
     def get_served_model_name(self, default: str) -> str:
         """Get served model name from vLLM config, or return default."""
         if self.vllm_config:
@@ -249,6 +277,7 @@ class VLLMProtocol:
                             nixl_port=nixl_port,
                             fpm_port=fpm_port,
                             fpm_publisher=is_leader,
+                            kv_events_publisher=is_leader,
                         )
                     )
                     current_sys_port += 1
@@ -303,6 +332,7 @@ class VLLMProtocol:
                             nixl_port=nixl_port,
                             fpm_port=fpm_port,
                             fpm_publisher=True,
+                            kv_events_publisher=True,
                         )
                     )
                     current_sys_port += 1

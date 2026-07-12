@@ -277,6 +277,8 @@ class TestEndpointsToProcesses:
         assert child.bootstrap_port == leader.bootstrap_port
         assert leader.fpm_publisher is True
         assert child.fpm_publisher is False
+        assert leader.kv_events_publisher is True
+        assert child.kv_events_publisher is False
 
     def test_cuda_visible_devices(self):
         """Test that CUDA_VISIBLE_DEVICES is set correctly for each process."""
@@ -362,7 +364,7 @@ class TestEndpointsToProcesses:
 
         assert [process.fpm_port for process in processes] == [20380, 20508]
 
-    def test_vllm_dp_ranks_are_all_expected_fpm_publishers(self):
+    def test_vllm_dp_ranks_are_all_expected_telemetry_publishers(self):
         from srtctl.backends import VLLMProtocol, VLLMServerConfig
         from srtctl.core.topology import Endpoint
 
@@ -381,6 +383,7 @@ class TestEndpointsToProcesses:
 
         assert len(processes) == 2
         assert all(process.fpm_publisher for process in processes)
+        assert all(process.kv_events_publisher for process in processes)
 
     def test_nixl_port_allocation(self):
         """Test NIXL ports are allocated globally unique starting at 6550."""

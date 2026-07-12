@@ -170,6 +170,7 @@ class Process:
         nixl_port: NIXL side channel port for KV transfers (vLLM only)
         fpm_port: Base port for backend-local forward-pass metrics publishing
         fpm_publisher: Whether this process is expected to register an FPM worker
+        kv_events_publisher: Whether this process runs a scheduler that publishes KV events
         endpoint_mode: The mode of the parent endpoint
         endpoint_index: The index of the parent endpoint
         node_rank: Rank within the endpoint (0 for leader)
@@ -187,6 +188,7 @@ class Process:
     nixl_port: int | None = None
     fpm_port: int | None = None
     fpm_publisher: bool = False
+    kv_events_publisher: bool = False
 
     @property
     def is_leader(self) -> bool:
@@ -445,6 +447,7 @@ def endpoints_to_processes(
                     nixl_port=node_nixl_port,
                     fpm_port=node_fpm_port,
                     fpm_publisher=is_leader,
+                    kv_events_publisher=is_leader,
                 )
             )
             current_sys_port += 1

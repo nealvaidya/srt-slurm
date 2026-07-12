@@ -79,42 +79,72 @@ class TelemetryStageMixin:
         registry: ProcessRegistry,
         stop_event: threading.Event,
     ) -> bool:
-        """Wait until every expected Dynamo producer has opened a trace file."""
+        """Wait until all enabled benchmark-owned telemetry collectors are ready."""
         fpm = self.config.telemetry.forward_pass_metrics
-        if not fpm.enabled:
+        kv_events = self.config.telemetry.kv_cache_events
+        if not fpm.enabled and not kv_events.enabled:
             return True
 
         telemetry_dir = self.runtime.log_dir / self.config.telemetry.storage_subdir
         trace_dir = telemetry_dir / "fpm"
-        ready_path = telemetry_dir / "fpm.ready"
+        fpm_ready_path = telemetry_dir / "fpm.ready"
+        kv_ready_path = telemetry_dir / "kv_events.ready"
         expected_producers = sum(process.fpm_publisher for process in self.backend_processes)
-        deadline = time.monotonic() + fpm.ready_timeout_secs
-        logger.info("Waiting for %d Dynamo FPM trace producer(s) under %s", expected_producers, trace_dir)
-        while time.monotonic() < deadline and not stop_event.is_set():
-            producer_ids = _trace_producer_ids(trace_dir)
-            if len(producer_ids) >= expected_producers:
-                ready_path.write_text(
-                    json.dumps(
-                        {
-                            "ready": True,
-                            "expected_producers": expected_producers,
-                            "producer_ids": sorted(producer_ids),
-                        },
-                        indent=2,
+        started_at = time.monotonic()
+        fpm_ready = not fpm.enabled
+        kv_ready = not kv_events.enabled
+        if fpm.enabled:
+            logger.info("Waiting for %d Dynamo FPM trace producer(s) under %s", expected_producers, trace_dir)
+        if kv_events.enabled:
+            logger.info("Waiting for Tachometer KV-event subscribers at %s", kv_ready_path)
+
+        while not stop_event.is_set():
+            elapsed = time.monotonic() - started_at
+            if not fpm_ready:
+                producer_ids = _trace_producer_ids(trace_dir)
+                if len(producer_ids) >= expected_producers:
+                    fpm_ready_path.write_text(
+                        json.dumps(
+                            {
+                                "ready": True,
+                                "expected_producers": expected_producers,
+                                "producer_ids": sorted(producer_ids),
+                            },
+                            indent=2,
+                        )
+                        + "\n"
                     )
-                    + "\n"
+                    logger.info("Dynamo FPM tracing is ready for %d producer(s)", len(producer_ids))
+                    fpm_ready = True
+                elif elapsed >= fpm.ready_timeout_secs:
+                    logger.error(
+                        "Dynamo FPM trace producers did not become ready within %ss",
+                        fpm.ready_timeout_secs,
+                    )
+                    return False
+
+            if not kv_ready and kv_ready_path.is_file():
+                try:
+                    marker = json.loads(kv_ready_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    marker = {}
+                if marker.get("ready") is True:
+                    logger.info("Tachometer KV-event subscribers are ready")
+                    kv_ready = True
+            if not kv_ready and elapsed >= kv_events.ready_timeout_secs:
+                logger.error(
+                    "Tachometer KV-event subscribers did not become ready within %ss",
+                    kv_events.ready_timeout_secs,
                 )
-                logger.info("Dynamo FPM tracing is ready for %d producer(s)", len(producer_ids))
+                return False
+
+            if fpm_ready and kv_ready:
                 return True
             if registry.check_failures():
-                logger.error("A critical process failed while waiting for FPM readiness")
+                logger.error("A critical process failed while waiting for telemetry readiness")
                 return False
             time.sleep(1)
 
-        logger.error(
-            "Dynamo FPM trace producers did not become ready within %ss",
-            fpm.ready_timeout_secs,
-        )
         return False
 
     def start_telemetry(self) -> list[ManagedProcess]:
@@ -146,6 +176,10 @@ class TelemetryStageMixin:
         if telemetry.forward_pass_metrics.enabled:
             (telemetry_dir / "fpm").mkdir(parents=True, exist_ok=True)
             for stale_path in (telemetry_dir / "fpm.ready", telemetry_dir / "fpm_manifest.json"):
+                stale_path.unlink(missing_ok=True)
+        if telemetry.kv_cache_events.enabled:
+            (telemetry_dir / "kv-events").mkdir(parents=True, exist_ok=True)
+            for stale_path in (telemetry_dir / "kv_events.ready", telemetry_dir / "kv_events_manifest.json"):
                 stale_path.unlink(missing_ok=True)
 
         worker_nodes = sorted({process.node for process in self.backend_processes})

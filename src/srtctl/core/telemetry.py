@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from srtctl.core.slurm import get_hostname_ip
 
@@ -144,14 +144,70 @@ def generate_telemetry_config(
             "metadata": metadata,
         }
 
+    event_streams_config: dict[str, object] | None = None
+    if telemetry.kv_cache_events.enabled:
+        sources: list[dict[str, object]] = []
+        for process in sorted(
+            (process for process in processes if process.kv_events_publisher),
+            key=lambda process: (
+                process.endpoint_mode,
+                process.endpoint_index,
+                process.node_rank,
+                process.node,
+            ),
+        ):
+            if process.kv_events_port is None:
+                raise ValueError("KV-cache event recording enabled but a publisher has no allocated port")
+            node_ip = get_hostname_ip(process.node, runtime.network_interface)
+            metadata = {
+                "hostname": process.node,
+                "job_id": runtime.job_id,
+                "run_name": runtime.run_name,
+                "worker_index": str(process.endpoint_index),
+                "worker_process": str(process.node_rank),
+                "worker_role": process.endpoint_mode,
+                "dp_rank": str(process.node_rank),
+            }
+            metadata.update(telemetry.extra_metadata)
+            sources.append(
+                {
+                    "name": (
+                        f"vllm_{process.endpoint_mode}{process.endpoint_index}_rank{process.node_rank}_{process.node}"
+                    ),
+                    "transport": "zmq",
+                    "codec": "vllm_kv_events_v1",
+                    "endpoint": f"tcp://{node_ip}:{process.kv_events_port}",
+                    "topic": telemetry.kv_cache_events.topic,
+                    "metadata": metadata,
+                }
+            )
+        if not sources:
+            raise ValueError("KV-cache event recording enabled but no vLLM publisher processes were found")
+        event_streams_config = {
+            "trace_dir": f"/logs/{telemetry.storage_subdir}/kv-events",
+            "manifest_path": f"/logs/{telemetry.storage_subdir}/kv_events_manifest.json",
+            "ready_path": f"/logs/{telemetry.storage_subdir}/kv_events.ready",
+            "roll_bytes": telemetry.kv_cache_events.jsonl_gz_roll_bytes,
+            "max_segments": telemetry.kv_cache_events.max_segments,
+            "ready_delay_ms": telemetry.kv_cache_events.ready_delay_ms,
+            "sources": sources,
+        }
+
     return _dump_toml(
         endpoints=endpoints,
         storage=f"/logs/{telemetry.storage_subdir}",
         fpm=fpm_config,
+        event_streams=event_streams_config,
     )
 
 
-def _dump_toml(*, endpoints: list[TelemetryEndpoint], storage: str, fpm: dict[str, object] | None) -> str:
+def _dump_toml(
+    *,
+    endpoints: list[TelemetryEndpoint],
+    storage: str,
+    fpm: dict[str, object] | None,
+    event_streams: dict[str, object] | None,
+) -> str:
     """Render a compact TOML document without extra dependencies."""
     lines = [f"storage = {json.dumps(storage)}", ""]
     for endpoint in endpoints:
@@ -184,4 +240,33 @@ def _dump_toml(*, endpoints: list[TelemetryEndpoint], storage: str, fpm: dict[st
             for key, value in sorted(values.items()):
                 lines.append(f"{json.dumps(key)} = {json.dumps(value)}")
         lines.append("")
+
+    if event_streams is not None:
+        lines.append("[event_streams]")
+        for key in (
+            "trace_dir",
+            "manifest_path",
+            "ready_path",
+            "roll_bytes",
+            "max_segments",
+            "ready_delay_ms",
+        ):
+            lines.append(f"{key} = {json.dumps(event_streams[key])}")
+        lines.append("")
+        sources = event_streams["sources"]
+        if not isinstance(sources, list):
+            raise TypeError("event_streams.sources must be a list")
+        for source in sources:
+            if not isinstance(source, dict):
+                raise TypeError("event_streams source must be a dictionary")
+            source_values = cast(dict[str, object], source)
+            lines.append("[[event_streams.sources]]")
+            for key in ("name", "transport", "codec", "endpoint", "topic"):
+                lines.append(f"{key} = {json.dumps(source_values[key])}")
+            metadata = source_values.get("metadata")
+            if isinstance(metadata, dict) and metadata:
+                lines.append("[event_streams.sources.metadata]")
+                for key, value in sorted(metadata.items()):
+                    lines.append(f"{json.dumps(key)} = {json.dumps(value)}")
+            lines.append("")
     return "\n".join(lines).rstrip() + "\n"

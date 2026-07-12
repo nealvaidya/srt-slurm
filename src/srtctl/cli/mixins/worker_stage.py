@@ -134,6 +134,16 @@ class WorkerStageMixin:
             }
         )
 
+    def _apply_kv_event_publisher_args(self, cmd: list[str], process: "Process") -> None:
+        """Enable the backend's native KV-event publisher when requested."""
+        telemetry = getattr(self.config, "telemetry", None)
+        if telemetry is None or not telemetry.kv_cache_events.enabled:
+            return
+        builder = getattr(self.backend, "build_kv_event_publisher_args", None)
+        if builder is None:
+            raise ValueError("KV-cache event recording is not supported by this backend")
+        cmd.extend(builder(process, telemetry.kv_cache_events.topic))
+
     def start_worker(self, process: "Process", endpoint_processes: list["Process"]) -> ManagedProcess:
         """Start a single worker process (one srun per node, used by SGLang)."""
         mode = process.endpoint_mode
@@ -165,6 +175,7 @@ class WorkerStageMixin:
             nsys_prefix=nsys_prefix,
             dump_config_path=config_dump,
         )
+        self._apply_kv_event_publisher_args(cmd, process)
 
         # Environment variables
         env_to_set = {
@@ -298,6 +309,7 @@ class WorkerStageMixin:
             nsys_prefix=nsys_prefix,
             dump_config_path=config_dump,
         )
+        self._apply_kv_event_publisher_args(cmd, leader)
 
         # Environment variables
         env_to_set = {

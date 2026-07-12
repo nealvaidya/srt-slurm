@@ -260,3 +260,27 @@ class TestDryRunExecutionExtensions:
         assert "telemetry.fpm" in output
         assert "max_segments" in output
         assert "64" in output
+
+    def test_kv_cache_event_details_shown(self, capsys):
+        config = _make_config(
+            {
+                "backend": {"type": "vllm"},
+                "telemetry": {
+                    "enabled": True,
+                    "container_image": "telemetry:latest",
+                    "dcgm_exporter": {"container_image": "dcgm:latest", "port": 9401},
+                    "node_exporter": {"container_image": "node:latest", "port": 9101},
+                    "kv_cache_events": {
+                        "enabled": True,
+                        "topic": "kv-events",
+                        "max_segments": 8,
+                        "ready_delay_ms": 250,
+                    },
+                },
+            }
+        )
+        show_config_details(config)
+        output = capsys.readouterr().out
+        assert "kv-events" in output
+        assert "ready_delay_ms" in output
+        assert "max_segments" in output

@@ -287,6 +287,16 @@ def show_config_details(config: SrtConfig) -> None:
                 details.add_row("telemetry.fpm", "sample_interval_ms", str(fpm.sample_interval_ms))
                 details.add_row("telemetry.fpm", "jsonl_gz_roll_bytes", str(fpm.jsonl_gz_roll_bytes))
                 details.add_row("telemetry.fpm", "max_segments", str(fpm.max_segments))
+            kv_events = config.telemetry.kv_cache_events
+            if kv_events.enabled:
+                details.add_row("telemetry.kv_cache_events", "topic", kv_events.topic or "<all>")
+                details.add_row(
+                    "telemetry.kv_cache_events",
+                    "jsonl_gz_roll_bytes",
+                    str(kv_events.jsonl_gz_roll_bytes),
+                )
+                details.add_row("telemetry.kv_cache_events", "max_segments", str(kv_events.max_segments))
+                details.add_row("telemetry.kv_cache_events", "ready_delay_ms", str(kv_events.ready_delay_ms))
 
         console.print(Panel(details, border_style="blue"))
 

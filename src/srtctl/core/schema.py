@@ -875,6 +875,25 @@ class ForwardPassMetricsTelemetryConfig:
 
 
 @dataclass(frozen=True)
+class KvCacheEventsTelemetryConfig:
+    """Direct vLLM KV-cache event recording configuration.
+
+    SRT enables vLLM's native ZMQ publisher on scheduler-bearing worker
+    processes and asks Tachometer to preserve each msgpack batch as compressed
+    JSONL without normalizing away block hashes, token IDs, or cache metadata.
+    """
+
+    enabled: bool = False
+    topic: str = ""
+    jsonl_gz_roll_bytes: int = 268_435_456
+    max_segments: int = 64
+    ready_delay_ms: int = 500
+    ready_timeout_secs: int = 600
+
+    Schema: ClassVar[type[Schema]] = Schema
+
+
+@dataclass(frozen=True)
 class TelemetryConfig:
     """Telemetry configuration for benchmark jobs.
 
@@ -894,6 +913,7 @@ class TelemetryConfig:
     dcgm_exporter: TelemetryExporterConfig | None = None
     node_exporter: TelemetryExporterConfig | None = None
     forward_pass_metrics: ForwardPassMetricsTelemetryConfig = field(default_factory=ForwardPassMetricsTelemetryConfig)
+    kv_cache_events: KvCacheEventsTelemetryConfig = field(default_factory=KvCacheEventsTelemetryConfig)
 
     Schema: ClassVar[type[Schema]] = Schema
 
@@ -1195,6 +1215,8 @@ class SrtConfig:
         if not telemetry.enabled:
             if telemetry.forward_pass_metrics.enabled:
                 raise ValidationError("telemetry.forward_pass_metrics requires telemetry.enabled=true")
+            if telemetry.kv_cache_events.enabled:
+                raise ValidationError("telemetry.kv_cache_events requires telemetry.enabled=true")
             return
 
         if telemetry.provider != TelemetryProvider.SCRAPER:
@@ -1226,6 +1248,18 @@ class SrtConfig:
                 raise ValidationError("telemetry.forward_pass_metrics.max_segments must be positive")
             if fpm.ready_timeout_secs <= 0:
                 raise ValidationError("telemetry.forward_pass_metrics.ready_timeout_secs must be positive")
+        if telemetry.kv_cache_events.enabled:
+            if self.backend_type != "vllm":
+                raise ValidationError("telemetry.kv_cache_events currently requires backend.type=vllm")
+            kv_events = telemetry.kv_cache_events
+            if kv_events.jsonl_gz_roll_bytes <= 0:
+                raise ValidationError("telemetry.kv_cache_events.jsonl_gz_roll_bytes must be positive")
+            if kv_events.max_segments <= 0:
+                raise ValidationError("telemetry.kv_cache_events.max_segments must be positive")
+            if kv_events.ready_delay_ms < 0:
+                raise ValidationError("telemetry.kv_cache_events.ready_delay_ms must be >= 0")
+            if kv_events.ready_timeout_secs <= 0:
+                raise ValidationError("telemetry.kv_cache_events.ready_timeout_secs must be positive")
 
     @classmethod
     def from_yaml(cls, yaml_path: Path) -> "SrtConfig":
