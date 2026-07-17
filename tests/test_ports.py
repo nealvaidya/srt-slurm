@@ -48,6 +48,12 @@ def test_neighboring_jobs_select_different_plans():
     assert first.node_port_allocator().base_fpm_port != second.node_port_allocator().base_fpm_port
 
 
+def test_highest_slot_keeps_full_fpm_reservation_in_registered_range():
+    plan = PortPlan(slot=PORT_SLOT_COUNT - 1)
+
+    assert plan.fpm_port_base + 1023 <= 49151
+
+
 def test_explicit_slot_override_is_honored():
     with patch.dict("os.environ", {"SRTCTL_PORT_SLOT": "7"}):
         plan = PortPlan.from_job_id("14084685")

@@ -67,6 +67,9 @@ class TelemetryStageMixin:
             container_image=exporter_config.container_image,
             container_mounts=self.runtime.container_mounts,
             srun_options=self.runtime.srun_options,
+            # Exporter images are commonly distroless or scratch-based and do
+            # not contain bash. Their commands do not need shell expansion.
+            use_bash_wrapper=False,
         )
         return ManagedProcess(
             name=name,
@@ -172,8 +175,6 @@ class TelemetryStageMixin:
 
         telemetry_dir = self.runtime.log_dir / telemetry.storage_subdir
         telemetry_dir.mkdir(parents=True, exist_ok=True)
-        local_dir = telemetry_dir / "local"
-        local_dir.mkdir(parents=True, exist_ok=True)
         if telemetry.forward_pass_metrics.enabled:
             (telemetry_dir / "fpm").mkdir(parents=True, exist_ok=True)
             for stale_path in (telemetry_dir / "fpm.ready", telemetry_dir / "fpm_manifest.json"):
@@ -212,7 +213,7 @@ class TelemetryStageMixin:
             "--config",
             "/telemetry_config.toml",
             "--local-dir",
-            f"/logs/{telemetry.storage_subdir}/local",
+            f"/logs/{telemetry.storage_subdir}/scraper/local",
         ]
         if telemetry.sync_interval_secs > 0:
             cmd.extend(["--sync-interval", str(telemetry.sync_interval_secs)])

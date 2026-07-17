@@ -153,7 +153,7 @@ class TestTelemetryConfigGeneration:
             telemetry=telemetry,
         )
 
-        assert 'storage = "/logs/telemetry"' in config_text
+        assert 'storage = "/logs/telemetry/scraper"' in config_text
         assert 'name = "dcgm_node-a"' in config_text
         assert 'url = "http://10.0.0.1:8081/metrics"' in config_text
         assert '"cluster" = "pdx"' in config_text
@@ -285,7 +285,10 @@ class TestTelemetryStageMixin:
     """Telemetry stage startup."""
 
     @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
-    @patch("srtctl.cli.mixins.telemetry_stage.generate_telemetry_config", return_value='storage = "/logs/telemetry"\n')
+    @patch(
+        "srtctl.cli.mixins.telemetry_stage.generate_telemetry_config",
+        return_value='storage = "/logs/telemetry/scraper"\n',
+    )
     def test_start_telemetry_starts_exporters_and_scraper(self, _mock_config, mock_srun, tmp_path):
         class Harness(TelemetryStageMixin):
             def __init__(self):
@@ -333,11 +336,17 @@ class TestTelemetryStageMixin:
 
         assert len(procs) == 3
         assert (tmp_path / "telemetry_config.toml").exists()
-        assert (tmp_path / "telemetry" / "local").exists()
+        assert (tmp_path / "telemetry").exists()
+        assert not (tmp_path / "telemetry" / "local").exists()
         assert mock_srun.call_count == 3
+        assert mock_srun.call_args_list[0].kwargs["use_bash_wrapper"] is False
+        assert mock_srun.call_args_list[1].kwargs["use_bash_wrapper"] is False
 
     @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
-    @patch("srtctl.cli.mixins.telemetry_stage.generate_telemetry_config", return_value='storage = "/logs/telemetry"\n')
+    @patch(
+        "srtctl.cli.mixins.telemetry_stage.generate_telemetry_config",
+        return_value='storage = "/logs/telemetry/scraper"\n',
+    )
     def test_start_telemetry_uses_producer_traces_without_sidecar(self, _mock_config, mock_srun, tmp_path):
         class Harness(TelemetryStageMixin):
             def __init__(self):

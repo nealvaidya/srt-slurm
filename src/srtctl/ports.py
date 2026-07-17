@@ -21,7 +21,10 @@ if TYPE_CHECKING:
     from srtctl.core.topology import NodePortAllocator
 
 
-PORT_SLOT_COUNT = 32
+# FPM reserves 1,024 ports per slot starting at 20,380. Twenty-eight slots
+# keep the complete highest-slot reservation within Dynamo's registered
+# user-port ceiling (49,151).
+PORT_SLOT_COUNT = 28
 PORT_SLOT_STRIDE = 128
 
 

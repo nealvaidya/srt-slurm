@@ -3,10 +3,13 @@
 
 """Tests for benchmark runners."""
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from srtctl.benchmarks import get_runner, list_benchmarks
 from srtctl.benchmarks.base import SCRIPTS_DIR
+from srtctl.cli.mixins.benchmark_stage import BenchmarkStageMixin
 
 
 class TestBenchmarkRegistry:
@@ -33,6 +36,25 @@ class TestBenchmarkRegistry:
         """Raises ValueError for unknown benchmark type."""
         with pytest.raises(ValueError, match="Unknown benchmark type"):
             get_runner("nonexistent-benchmark")
+
+
+def test_benchmark_env_includes_allocated_frontend_port():
+    """Custom benchmark scripts receive the job-scoped frontend port."""
+
+    class Harness(BenchmarkStageMixin):
+        def _get_benchmark_profiling_env(self, _runner):
+            return {}
+
+    harness = Harness()
+    harness.config = MagicMock()
+    harness.config.frontend.type = "dynamo"
+    harness.runtime = MagicMock()
+    harness.runtime.port_plan.frontend_public_port = 11584
+
+    env = harness._get_benchmark_env(MagicMock())
+
+    assert env["SRTCTL_FRONTEND_TYPE"] == "dynamo"
+    assert env["SRTCTL_FRONTEND_PORT"] == "11584"
 
 
 class TestSABenchRunner:

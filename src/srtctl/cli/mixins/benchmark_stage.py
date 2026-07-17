@@ -326,6 +326,7 @@ class BenchmarkStageMixin:
 
         env = self._get_benchmark_profiling_env(runner)
         env["SRTCTL_FRONTEND_TYPE"] = self.config.frontend.type
+        env["SRTCTL_FRONTEND_PORT"] = str(self.runtime.port_plan.frontend_public_port)
 
         # Add AIPerf-specific env vars for AIPerf-driven benchmarks only
         if isinstance(runner, AIPerfBenchmarkRunner):

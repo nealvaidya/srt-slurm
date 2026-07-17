@@ -202,7 +202,10 @@ def generate_telemetry_config(
 
     return _dump_toml(
         endpoints=endpoints,
-        storage=f"/logs/{telemetry.storage_subdir}",
+        # Tachometer owns this new nested directory. The parent is created by
+        # srtctl for FPM traces and readiness markers, while current scraper
+        # builds reject an already-existing storage directory.
+        storage=f"/logs/{telemetry.storage_subdir}/scraper",
         fpm=fpm_config,
         event_streams=event_streams_config,
     )
