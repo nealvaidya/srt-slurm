@@ -13,6 +13,7 @@ This module consolidates all SLURM-related functionality:
 
 import logging
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -22,6 +23,17 @@ from pathlib import Path
 from .ip_utils import get_node_ip
 
 logger = logging.getLogger(__name__)
+
+_SENSITIVE_ENV_NAME = re.compile(r"(?:token|secret|password|credential|(?:api|access|private)[_-]?key)", re.IGNORECASE)
+
+
+def _command_for_log(command: list[str], env_to_set: dict[str, str] | None) -> str:
+    """Render an srun command without exposing credential-valued env vars."""
+    rendered = shlex.join(command)
+    for name, value in (env_to_set or {}).items():
+        if value and _SENSITIVE_ENV_NAME.search(name):
+            rendered = rendered.replace(value, "<redacted>")
+    return rendered
 
 
 # ============================================================================
@@ -264,7 +276,7 @@ def start_srun_process(
     else:
         srun_cmd.extend(command)
 
-    logger.info("srun command: %s", shlex.join(srun_cmd))
+    logger.info("srun command: %s", _command_for_log(srun_cmd, env_to_set))
 
     # Start the process
     proc = subprocess.Popen(

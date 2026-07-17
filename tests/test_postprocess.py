@@ -179,6 +179,20 @@ class TestPostProcessStageMixin:
 
         assert result == "config-value"
 
+    def test_job_s3_config_wins_over_shared_cluster_config(self):
+        """A concurrent submit cannot redirect an active job's upload prefix."""
+        from srtctl.cli.mixins.postprocess_stage import PostProcessStageMixin
+
+        job_s3 = S3Config(bucket="job-bucket", prefix="job-prefix")
+        mixin = PostProcessStageMixin()
+        mixin.config = MagicMock()
+        mixin.config.reporting = ReportingConfig(s3=job_s3)
+
+        with patch("srtctl.cli.mixins.postprocess_stage.load_cluster_config") as load_cluster:
+            assert mixin._get_s3_config() is job_s3
+
+        load_cluster.assert_not_called()
+
     def test_resolve_secret_from_env(self, monkeypatch):
         """Test secret resolution falls back to environment variable."""
         from srtctl.cli.mixins.postprocess_stage import PostProcessStageMixin

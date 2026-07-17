@@ -87,6 +87,15 @@ class PostProcessStageMixin:
         Returns:
             S3Config if configured, None otherwise
         """
+        # The submitted recipe is copied into the job output directory and
+        # parsed into self.config before post-processing.  Prefer its reporting
+        # block so a concurrent submission cannot redirect this job by
+        # overwriting a shared SRTSLURM_CONFIG file on the login filesystem.
+        job_reporting = getattr(self.config, "reporting", None)
+        job_s3 = getattr(job_reporting, "s3", None) if job_reporting else None
+        if job_s3:
+            return job_s3
+
         cluster_config = load_cluster_config()
         if not cluster_config:
             return None

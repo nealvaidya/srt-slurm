@@ -37,6 +37,26 @@ def test_start_srun_exports_env_before_preamble() -> None:
     assert bash_cmd.index("echo preamble") < bash_cmd.index("python3 -m server")
 
 
+def test_start_srun_redacts_secret_env_values_from_log(caplog) -> None:
+    with (
+        patch("srtctl.core.slurm.get_slurm_job_id", return_value="12345"),
+        patch("subprocess.Popen") as mock_popen,
+        caplog.at_level("INFO", logger="srtctl.core.slurm"),
+    ):
+        mock_popen.return_value = MagicMock()
+        start_srun_process(
+            ["python3", "-m", "uploader"],
+            env_to_set={"AWS_ACCESS_KEY_ID": "example-access", "AWS_SECRET_ACCESS_KEY": "example-secret"},
+        )
+
+    assert "example-access" not in caplog.text
+    assert "example-secret" not in caplog.text
+    assert caplog.text.count("<redacted>") == 2
+    bash_cmd = _built_bash_command(mock_popen)
+    assert "example-access" in bash_cmd
+    assert "example-secret" in bash_cmd
+
+
 def test_wrapped_nonfatal_hook_does_not_mask_prior_preamble_failure() -> None:
     bash_cmd = "false && ( false || true ) && echo main"
 
