@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 from srtctl.cli.mixins.worker_stage import WorkerStageMixin
 from srtctl.core.schema import ObservabilityConfig
 from srtctl.core.slurm import start_srun_process
+from srtctl.ports import PortPlan
 
 
 def _built_bash_command(mock_popen: MagicMock) -> str:
@@ -69,6 +70,7 @@ def test_worker_stage_wraps_nonfatal_fingerprint_hook(tmp_path: Path) -> None:
         container_image=Path("/container.sqsh"),
         container_mounts={},
         srun_options=[],
+        port_plan=PortPlan.default(),
     )
     process = SimpleNamespace(
         endpoint_mode="prefill",

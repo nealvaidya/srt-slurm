@@ -41,10 +41,10 @@ if [[ -z "${PROFILE_CONCURRENCY}" ]]; then
     exit 1
 fi
 
-# Parse leader IP lists from environment (comma-separated)
-IFS=',' read -r -a PREFILL_IPS <<< "${PROFILE_PREFILL_IPS:-}"
-IFS=',' read -r -a DECODE_IPS <<< "${PROFILE_DECODE_IPS:-}"
-IFS=',' read -r -a AGG_IPS <<< "${PROFILE_AGG_IPS:-}"
+# Parse leader endpoints from environment (comma-separated host:port values)
+IFS=',' read -r -a PREFILL_ENDPOINTS <<< "${PROFILE_PREFILL_ENDPOINTS:-}"
+IFS=',' read -r -a DECODE_ENDPOINTS <<< "${PROFILE_DECODE_ENDPOINTS:-}"
+IFS=',' read -r -a AGG_ENDPOINTS <<< "${PROFILE_AGG_ENDPOINTS:-}"
 
 # Get phase-specific start/stop steps
 get_phase_start_step() {
@@ -61,11 +61,11 @@ get_phase_stop_step() {
 
 # Start profiling on a worker
 start_profile_on_worker() {
-    local ip="$1"
+    local endpoint="$1"
     local start_step="$2"
     local stop_step="$3"
     
-    if [[ -z "${ip}" ]]; then
+    if [[ -z "${endpoint}" ]]; then
         return
     fi
     
@@ -83,16 +83,16 @@ start_profile_on_worker() {
         ACTIVITIES='["CUDA_PROFILER"]'
     fi
     
-    echo "Starting profiling on http://${ip}:30000 (steps ${start_step}-${stop_step})"
-    curl -sS -X POST "http://${ip}:30000/start_profile" \
+    echo "Starting profiling on http://${endpoint} (steps ${start_step}-${stop_step})"
+    curl -sS -X POST "http://${endpoint}/start_profile" \
         -H "Content-Type: application/json" \
         -d "{\"start_step\": ${start_step}, \"num_steps\": ${num_steps}, \"activities\": ${ACTIVITIES}}" || true
 }
 
 # Check if we have any workers to profile
-if [[ "${#PREFILL_IPS[@]}" -eq 0 && "${#DECODE_IPS[@]}" -eq 0 && "${#AGG_IPS[@]}" -eq 0 ]]; then
+if [[ "${#PREFILL_ENDPOINTS[@]}" -eq 0 && "${#DECODE_ENDPOINTS[@]}" -eq 0 && "${#AGG_ENDPOINTS[@]}" -eq 0 ]]; then
     echo "Error: No worker IPs provided for profiling"
-    echo "Set PROFILE_PREFILL_IPS, PROFILE_DECODE_IPS, or PROFILE_AGG_IPS"
+    echo "Set PROFILE_PREFILL_ENDPOINTS, PROFILE_DECODE_ENDPOINTS, or PROFILE_AGG_ENDPOINTS"
     exit 1
 fi
 
@@ -116,14 +116,14 @@ agg_start=$(get_phase_start_step AGG)
 agg_stop=$(get_phase_stop_step AGG)
 
 # Start profiling on all workers
-for ip in "${PREFILL_IPS[@]}"; do
-    start_profile_on_worker "${ip}" "${prefill_start}" "${prefill_stop}"
+for endpoint in "${PREFILL_ENDPOINTS[@]}"; do
+    start_profile_on_worker "${endpoint}" "${prefill_start}" "${prefill_stop}"
 done
-for ip in "${DECODE_IPS[@]}"; do
-    start_profile_on_worker "${ip}" "${decode_start}" "${decode_stop}"
+for endpoint in "${DECODE_ENDPOINTS[@]}"; do
+    start_profile_on_worker "${endpoint}" "${decode_start}" "${decode_stop}"
 done
-for ip in "${AGG_IPS[@]}"; do
-    start_profile_on_worker "${ip}" "${agg_start}" "${agg_stop}"
+for endpoint in "${AGG_ENDPOINTS[@]}"; do
+    start_profile_on_worker "${endpoint}" "${agg_start}" "${agg_stop}"
 done
 
 # Only the prefill profiling job needs to generate traffic through the router.
@@ -164,4 +164,3 @@ if [[ -n "${SGLANG_TORCH_PROFILER_DIR}" ]]; then
 fi
 
 exit ${exit_code}
-

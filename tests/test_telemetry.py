@@ -26,7 +26,7 @@ from srtctl.core.schema import (
     TelemetryConfig,
     TelemetryExporterConfig,
 )
-from srtctl.core.telemetry import generate_telemetry_config
+from srtctl.core.telemetry import effective_exporter_port, generate_telemetry_config
 from srtctl.core.topology import Process
 
 
@@ -83,6 +83,20 @@ class TestTelemetryConfig:
                     kv_cache_events=KvCacheEventsTelemetryConfig(enabled=True),
                 )
             )
+
+    def test_managed_exporter_port_is_job_scoped(self):
+        exporter = TelemetryExporterConfig(container_image="dcgm:latest", port=9401)
+
+        assert effective_exporter_port(exporter, 256) == 9657
+
+    def test_opaque_custom_exporter_command_keeps_its_declared_port(self):
+        exporter = TelemetryExporterConfig(
+            container_image="custom:latest",
+            port=9401,
+            command="custom-exporter --listen :9401",
+        )
+
+        assert effective_exporter_port(exporter, 256) == 9401
 
 
 class TestTelemetryConfigGeneration:

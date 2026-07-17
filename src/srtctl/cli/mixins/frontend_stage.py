@@ -88,8 +88,8 @@ class FrontendStageMixin:
             return FrontendTopology(
                 nginx_node=None,
                 frontend_nodes=[head],
-                frontend_port=8000,
-                public_port=8000,
+                frontend_port=self.runtime.port_plan.frontend_public_port,
+                public_port=self.runtime.port_plan.frontend_public_port,
             )
 
         # Multiple nodes with multiple frontends enabled:
@@ -113,8 +113,8 @@ class FrontendStageMixin:
         return FrontendTopology(
             nginx_node=head,
             frontend_nodes=frontend_nodes,
-            frontend_port=8180,  # Internal port behind nginx
-            public_port=8000,  # Public port exposed by nginx
+            frontend_port=self.runtime.port_plan.frontend_internal_port,
+            public_port=self.runtime.port_plan.frontend_public_port,
         )
 
     def _start_nginx(self, topology: FrontendTopology) -> ManagedProcess:

@@ -103,8 +103,8 @@ class WorkerStageMixin:
         if leader.kv_events_port is None:
             return
 
-        port_offset = max(0, leader.kv_events_port - 5550)
-        pub_port = 56001 + (port_offset * 2)
+        port_offset = max(0, leader.kv_events_port - self.runtime.port_plan.kv_events_port_base)
+        pub_port = self.runtime.port_plan.kvbm_zmq_port_base + (port_offset * 2)
         ack_port = pub_port + 1
         if ack_port <= 65535:
             env_to_set.setdefault("DYN_KVBM_LEADER_ZMQ_PUB_PORT", str(pub_port))
@@ -180,8 +180,8 @@ class WorkerStageMixin:
         # Environment variables
         env_to_set = {
             "HEAD_NODE_IP": self.runtime.head_node_ip,
-            "ETCD_ENDPOINTS": f"http://{self.runtime.nodes.infra}:2379",
-            "NATS_SERVER": f"nats://{self.runtime.nodes.infra}:4222",
+            "ETCD_ENDPOINTS": (f"http://{self.runtime.nodes.infra}:{self.runtime.port_plan.etcd_client_port}"),
+            "NATS_SERVER": f"nats://{self.runtime.nodes.infra}:{self.runtime.port_plan.nats_port}",
             "DYN_SYSTEM_PORT": str(process.sys_port),
             "DYN_REQUEST_PLANE": "nats",
         }
@@ -314,8 +314,8 @@ class WorkerStageMixin:
         # Environment variables
         env_to_set = {
             "HEAD_NODE_IP": self.runtime.head_node_ip,
-            "ETCD_ENDPOINTS": f"http://{self.runtime.nodes.infra}:2379",
-            "NATS_SERVER": f"nats://{self.runtime.nodes.infra}:4222",
+            "ETCD_ENDPOINTS": (f"http://{self.runtime.nodes.infra}:{self.runtime.port_plan.etcd_client_port}"),
+            "NATS_SERVER": f"nats://{self.runtime.nodes.infra}:{self.runtime.port_plan.nats_port}",
             "DYN_SYSTEM_PORT": str(leader.sys_port),
         }
 

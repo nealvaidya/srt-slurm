@@ -14,6 +14,7 @@ This script is called from within the sbatch job and coordinates:
 
 import argparse
 import functools
+import json
 import logging
 import os
 import subprocess
@@ -94,7 +95,11 @@ class SweepOrchestrator(
     @functools.cached_property
     def backend_processes(self) -> list[Process]:
         """Compute physical process topology from endpoints (cached)."""
-        return self.backend.endpoints_to_processes(self.endpoints)
+        return self.backend.endpoints_to_processes(
+            self.endpoints,
+            base_sys_port=self.runtime.port_plan.dyn_system_port_base,
+            port_allocator=self.runtime.port_plan.node_port_allocator(),
+        )
 
     def start_head_infrastructure(self, registry: ProcessRegistry) -> ManagedProcess:
         """Start NATS and etcd on the infra node.
@@ -120,6 +125,14 @@ class SweepOrchestrator(
             self.config.name,
             "--log-dir",
             str(self.runtime.log_dir),
+            "--state-dir",
+            f"/host-tmp/srtctl/{self.runtime.job_id}",
+            "--nats-port",
+            str(self.runtime.port_plan.nats_port),
+            "--etcd-client-port",
+            str(self.runtime.port_plan.etcd_client_port),
+            "--etcd-peer-port",
+            str(self.runtime.port_plan.etcd_peer_port),
         ]
         if self.config.infra.nats_max_payload_mb is not None:
             cmd += ["--nats-max-payload-mb", str(self.config.infra.nats_max_payload_mb)]
@@ -147,13 +160,13 @@ class SweepOrchestrator(
         )
 
         # 300s timeout to handle slow container imports on first run
-        logger.info("Waiting for NATS (port 4222) on %s...", infra_node)
-        if not wait_for_port(infra_node, 4222, timeout=300):
+        logger.info("Waiting for NATS (port %d) on %s...", self.runtime.port_plan.nats_port, infra_node)
+        if not wait_for_port(infra_node, self.runtime.port_plan.nats_port, timeout=300):
             raise RuntimeError("NATS failed to start")
         logger.info("NATS is ready")
 
-        logger.info("Waiting for etcd (port 2379) on %s...", infra_node)
-        if not wait_for_port(infra_node, 2379, timeout=300):
+        logger.info("Waiting for etcd (port %d) on %s...", self.runtime.port_plan.etcd_client_port, infra_node)
+        if not wait_for_port(infra_node, self.runtime.port_plan.etcd_client_port, timeout=300):
             raise RuntimeError("etcd failed to start")
         logger.info("etcd is ready")
 
@@ -170,7 +183,7 @@ class SweepOrchestrator(
         logger.info("=" * 60)
         logger.info("Connection Commands")
         logger.info("=" * 60)
-        logger.info("Frontend URL: http://%s:8000", self.runtime.nodes.head)
+        logger.info("Frontend URL: http://%s:%d", self.runtime.nodes.head, self.runtime.frontend_port)
         logger.info("")
         logger.info("To connect to head node (%s):", self.runtime.nodes.head)
         logger.info(
@@ -377,6 +390,10 @@ class SweepOrchestrator(
         logger.info("Worker nodes: %s", ", ".join(self.runtime.nodes.worker))
         if self.config.profiling.enabled:
             logger.info("Profiling: %s", self.config.profiling.type)
+
+        port_plan_path = self.runtime.log_dir.parent / "port_plan.json"
+        port_plan_path.write_text(json.dumps(self.runtime.port_plan.to_dict(), indent=2, sort_keys=True) + "\n")
+        logger.info("Port plan: slot=%d (%s)", self.runtime.port_plan.slot, port_plan_path)
 
         # Write initial lockfile with config + SLURM context (fingerprint added after run)
         write_lockfile(self.runtime.log_dir.parent, self.config)

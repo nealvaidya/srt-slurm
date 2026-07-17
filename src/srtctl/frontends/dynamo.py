@@ -79,8 +79,8 @@ class DynamoFrontend:
             cmd.extend(self.get_frontend_args_list(config.frontend.args))
 
             env_to_set = {
-                "ETCD_ENDPOINTS": f"http://{runtime.nodes.infra}:2379",
-                "NATS_SERVER": f"nats://{runtime.nodes.infra}:4222",
+                "ETCD_ENDPOINTS": f"http://{runtime.nodes.infra}:{runtime.port_plan.etcd_client_port}",
+                "NATS_SERVER": f"nats://{runtime.nodes.infra}:{runtime.port_plan.nats_port}",
                 "DYN_REQUEST_PLANE": "nats",
             }
             # Add OTEL env vars (before frontend env so OTEL_SERVICE_NAME can be overridden)

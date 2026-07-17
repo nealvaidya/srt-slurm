@@ -3,6 +3,7 @@
 
 """Tests for frontend topology logic (nginx + multiple frontends)."""
 
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -10,6 +11,7 @@ from srtctl.cli.do_sweep import SweepOrchestrator
 from srtctl.cli.mixins.frontend_stage import FrontendTopology
 from srtctl.core.runtime import Nodes, RuntimeContext
 from srtctl.core.schema import FrontendConfig, ResourceConfig, SrtConfig
+from srtctl.ports import PORT_SLOT_STRIDE, PortPlan
 
 
 def make_config(
@@ -171,6 +173,16 @@ class TestComputeFrontendTopology:
         # Only 2 nodes available for frontends (node1, node2)
         assert topology.frontend_nodes == ["node1", "node2"]
         assert len(topology.frontend_nodes) == 2
+
+    def test_job_scoped_frontend_ports(self):
+        config = make_config(enable_multiple_frontends=True)
+        runtime = make_runtime(["node0", "node1"])
+        runtime = replace(runtime, port_plan=PortPlan(slot=3))
+
+        topology = SweepOrchestrator(config=config, runtime=runtime)._compute_frontend_topology()
+
+        assert topology.public_port == 8000 + (3 * PORT_SLOT_STRIDE)
+        assert topology.frontend_port == 8180 + (3 * PORT_SLOT_STRIDE)
 
 
 class TestNginxConfigGeneration:

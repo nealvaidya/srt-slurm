@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from srtctl.ports import PortPlan
+
 from .config import get_srtslurm_setting
 from .slurm import get_hostname_ip, get_slurm_nodelist
 
@@ -117,8 +119,14 @@ class RuntimeContext:
     # Environment variables
     environment: dict[str, str] = field(default_factory=dict)
 
-    # Frontend port (for benchmark endpoint)
-    frontend_port: int = 8000
+    # Job-scoped listener ports. Direct construction keeps legacy slot 0;
+    # from_config derives a slot from the Slurm job ID.
+    port_plan: PortPlan = field(default_factory=PortPlan.default)
+
+    @property
+    def frontend_port(self) -> int:
+        """Public frontend port used by health checks and benchmarks."""
+        return self.port_plan.frontend_public_port
 
     @classmethod
     def from_config(
@@ -144,6 +152,7 @@ class RuntimeContext:
 
         # Compute run_name
         run_name = f"{config.name}_{job_id}"
+        port_plan = PortPlan.from_job_id(job_id)
 
         # Resolve node IPs
         head_node_ip = get_hostname_ip(nodes.head)
@@ -249,6 +258,7 @@ class RuntimeContext:
             srun_options=dict(config.srun_options),
             environment=dict(config.environment),
             is_hf_model=is_hf_model,
+            port_plan=port_plan,
         )
 
         # Expand FormattablePath mounts
@@ -272,6 +282,7 @@ class RuntimeContext:
             srun_options=dict(config.srun_options),
             environment=dict(config.environment),
             is_hf_model=is_hf_model,
+            port_plan=port_plan,
         )
 
     def format_string(self, template: str, **extra_kwargs) -> str:

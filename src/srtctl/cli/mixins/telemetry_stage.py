@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from srtctl.core.processes import ManagedProcess
 from srtctl.core.slurm import start_srun_process
-from srtctl.core.telemetry import generate_telemetry_config
+from srtctl.core.telemetry import effective_exporter_port, generate_telemetry_config
 
 if TYPE_CHECKING:
     from srtctl.core.processes import ProcessRegistry
@@ -51,10 +51,11 @@ class TelemetryStageMixin:
         default_command_template: str,
     ) -> ManagedProcess:
         """Start one exporter container across the requested nodes."""
+        port = effective_exporter_port(exporter_config, self.runtime.port_plan.offset)
         if exporter_config.command is None:
-            cmd_str = default_command_template.format(port=exporter_config.port)
+            cmd_str = default_command_template.format(port=port)
         elif "{port}" in exporter_config.command:
-            cmd_str = exporter_config.command.format(port=exporter_config.port)
+            cmd_str = exporter_config.command.format(port=port)
         else:
             cmd_str = exporter_config.command
 

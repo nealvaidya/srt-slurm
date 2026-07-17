@@ -12,6 +12,7 @@ import argparse
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -122,6 +123,8 @@ def setup_logging():
 def start_nats(
     binary_path: str = "/configs/nats-server",
     max_payload_mb: int | None = None,
+    port: int = NATS_PORT,
+    state_dir: Path = Path("/tmp/srtctl"),
 ) -> subprocess.Popen:
     """Start NATS server.
 
@@ -138,23 +141,23 @@ def start_nats(
 
     # Use /tmp for JetStream storage - avoids "Temporary storage directory" warning
     # and ensures we're using fast local storage
-    if os.path.exists("/tmp/nats"):
-        shutil.rmtree("/tmp/nats")
-    nats_store_dir = "/tmp/nats"
-    os.makedirs(nats_store_dir, exist_ok=True)
+    nats_store_dir = state_dir / "nats"
+    shutil.rmtree(nats_store_dir, ignore_errors=True)
+    nats_store_dir.mkdir(parents=True, exist_ok=True)
 
     if max_payload_mb is not None:
         # Write NATS config with custom max_payload
-        nats_config_path = "/tmp/nats.conf"
+        nats_config_path = state_dir / "nats.conf"
         max_payload_bytes = max_payload_mb * 1024 * 1024
         with open(nats_config_path, "w") as f:
             f.write(f"max_payload: {max_payload_bytes}\n")
+            f.write(f"port: {port}\n")
             f.write(f'jetstream {{ store_dir: "{nats_store_dir}" }}\n')
         logger.info("Starting NATS server (max_payload: %dMB)...", max_payload_mb)
-        cmd = [binary_path, "-c", nats_config_path]
+        cmd = [binary_path, "-c", str(nats_config_path)]
     else:
         logger.info("Starting NATS server...")
-        cmd = [binary_path, "-js", "-sd", nats_store_dir]
+        cmd = [binary_path, "-p", str(port), "-js", "-sd", str(nats_store_dir)]
 
     proc = subprocess.Popen(
         cmd,
@@ -168,6 +171,9 @@ def start_etcd(
     host_ip: str,
     binary_path: str = "/configs/etcd",
     log_dir: Path | None = None,
+    client_port: int = ETCD_CLIENT_PORT,
+    peer_port: int = ETCD_PEER_PORT,
+    state_dir: Path = Path("/tmp/srtctl"),
 ) -> subprocess.Popen:
     """Start etcd server.
 
@@ -187,19 +193,24 @@ def start_etcd(
     # Use /tmp for etcd data directory - this is typically on fast local storage
     # (often tmpfs on HPC systems). Without this, etcd uses "default.etcd" in CWD
     # which may be on slow network storage, causing Raft consensus timeouts.
-    if os.path.exists("/tmp/etcd"):
-        shutil.rmtree("/tmp/etcd")
-    etcd_data_dir = "/tmp/etcd"
-    os.makedirs(etcd_data_dir, exist_ok=True)
+    etcd_data_dir = state_dir / "etcd"
+    shutil.rmtree(etcd_data_dir, ignore_errors=True)
+    etcd_data_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [
         binary_path,
         "--data-dir",
-        etcd_data_dir,
+        str(etcd_data_dir),
         "--listen-client-urls",
-        f"{ETCD_LISTEN_ADDR}:{ETCD_CLIENT_PORT}",
+        f"{ETCD_LISTEN_ADDR}:{client_port}",
         "--advertise-client-urls",
-        f"http://{host_ip}:{ETCD_CLIENT_PORT}",  # Must be reachable IP, not 0.0.0.0
+        f"http://{host_ip}:{client_port}",  # Must be reachable IP, not 0.0.0.0
+        "--listen-peer-urls",
+        f"{ETCD_LISTEN_ADDR}:{peer_port}",
+        "--initial-advertise-peer-urls",
+        f"http://{host_ip}:{peer_port}",
+        "--initial-cluster",
+        f"default=http://{host_ip}:{peer_port}",
     ]
 
     # Set up output handling
@@ -214,6 +225,23 @@ def start_etcd(
 
     logger.info("etcd server started (PID: %d)", proc.pid)
     return proc
+
+
+def ensure_ports_available(ports: list[int]) -> None:
+    """Fail before launch when one of this job's infrastructure ports is occupied."""
+    probes: list[socket.socket] = []
+    try:
+        for port in ports:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                probe.bind(("0.0.0.0", port))
+            except OSError as exc:
+                probe.close()
+                raise RuntimeError(f"Required infrastructure port {port} is already in use") from exc
+            probes.append(probe)
+    finally:
+        for probe in probes:
+            probe.close()
 
 
 def wait_for_service(host: str, port: int, name: str, timeout: float = 300.0) -> bool:
@@ -267,6 +295,10 @@ def main():
         default=None,
         help="NATS max message payload in MB (default: NATS default 1MB)",
     )
+    parser.add_argument("--state-dir", type=Path, default=Path("/tmp/srtctl"))
+    parser.add_argument("--nats-port", type=int, default=NATS_PORT)
+    parser.add_argument("--etcd-client-port", type=int, default=ETCD_CLIENT_PORT)
+    parser.add_argument("--etcd-peer-port", type=int, default=ETCD_PEER_PORT)
 
     args = parser.parse_args()
 
@@ -279,27 +311,40 @@ def main():
     # Get our IP address using multiple fallback methods
     host_ip = get_local_ip()
     logger.info("Host IP: %s", host_ip)
+    ensure_ports_available([args.nats_port, args.etcd_client_port, args.etcd_peer_port])
 
     # Start services
     nats_proc = None
     etcd_proc = None
 
     try:
-        nats_proc = start_nats(args.nats_binary, max_payload_mb=args.nats_max_payload_mb)
-        etcd_proc = start_etcd(host_ip, args.etcd_binary, log_dir)
+        nats_proc = start_nats(
+            args.nats_binary,
+            max_payload_mb=args.nats_max_payload_mb,
+            port=args.nats_port,
+            state_dir=args.state_dir,
+        )
+        etcd_proc = start_etcd(
+            host_ip,
+            args.etcd_binary,
+            log_dir,
+            client_port=args.etcd_client_port,
+            peer_port=args.etcd_peer_port,
+            state_dir=args.state_dir,
+        )
 
         # Wait for services
-        if not wait_for_service("localhost", NATS_PORT, "NATS"):
+        if not wait_for_service("localhost", args.nats_port, "NATS"):
             logger.error("NATS failed to start")
             sys.exit(1)
 
-        if not wait_for_service("localhost", ETCD_CLIENT_PORT, "etcd"):
+        if not wait_for_service("localhost", args.etcd_client_port, "etcd"):
             logger.error("etcd failed to start")
             sys.exit(1)
 
         logger.info("Head node infrastructure is ready")
-        logger.info("  NATS: nats://localhost:%d", NATS_PORT)
-        logger.info("  etcd: http://localhost:%d", ETCD_CLIENT_PORT)
+        logger.info("  NATS: nats://localhost:%d", args.nats_port)
+        logger.info("  etcd: http://localhost:%d", args.etcd_client_port)
 
         # Keep running - wait for either process to exit
         while True:

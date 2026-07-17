@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from srtctl.core.runtime import RuntimeContext
-    from srtctl.core.topology import Endpoint, Process
+    from srtctl.core.topology import Endpoint, NodePortAllocator, Process
 
 
 class BackendType(str, Enum):
@@ -92,6 +92,7 @@ class BackendProtocol(Protocol):
         self,
         endpoints: list["Endpoint"],
         base_sys_port: int = 8081,
+        port_allocator: Optional["NodePortAllocator"] = None,
     ) -> list["Process"]:
         """Convert logical endpoints to physical processes."""
         ...

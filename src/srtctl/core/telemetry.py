@@ -14,8 +14,15 @@ from srtctl.core.slurm import get_hostname_ip
 if TYPE_CHECKING:
     from srtctl.cli.mixins.frontend_stage import FrontendTopology
     from srtctl.core.runtime import RuntimeContext
-    from srtctl.core.schema import TelemetryConfig
+    from srtctl.core.schema import TelemetryConfig, TelemetryExporterConfig
     from srtctl.core.topology import Process
+
+
+def effective_exporter_port(config: TelemetryExporterConfig, offset: int) -> int:
+    """Shift managed exporter commands while preserving opaque custom commands."""
+    port = config.port
+    command = config.command
+    return port + offset if command is None or "{port}" in command else port
 
 
 @dataclass(frozen=True)
@@ -65,7 +72,7 @@ def generate_telemetry_config(
         endpoints.append(
             TelemetryEndpoint(
                 name=f"dcgm_{node}",
-                url=f"http://{node}:{dcgm_exporter.port}/metrics",
+                url=f"http://{node}:{effective_exporter_port(dcgm_exporter, runtime.port_plan.offset)}/metrics",
                 frequency=telemetry.default_frequency,
                 filter="dcgm",
                 node_metadata=node_metadata,
@@ -75,7 +82,7 @@ def generate_telemetry_config(
         endpoints.append(
             TelemetryEndpoint(
                 name=f"node_exporter_{node}",
-                url=f"http://{node}:{node_exporter.port}/metrics",
+                url=f"http://{node}:{effective_exporter_port(node_exporter, runtime.port_plan.offset)}/metrics",
                 frequency=telemetry.default_frequency,
                 filter="node_exporter",
                 node_metadata=node_metadata,

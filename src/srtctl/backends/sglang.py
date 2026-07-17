@@ -25,7 +25,7 @@ from marshmallow_dataclass import dataclass
 if TYPE_CHECKING:
     from srtctl.backends.base import SrunConfig
     from srtctl.core.runtime import RuntimeContext
-    from srtctl.core.topology import Endpoint, Process
+    from srtctl.core.topology import Endpoint, NodePortAllocator, Process
 
 # Type alias for worker modes
 WorkerMode = Literal["prefill", "decode", "agg"]
@@ -198,11 +198,12 @@ class SGLangProtocol:
         self,
         endpoints: list["Endpoint"],
         base_sys_port: int = 8081,
+        port_allocator: "NodePortAllocator | None" = None,
     ) -> list["Process"]:
         """Convert endpoints to processes."""
         from srtctl.core.topology import endpoints_to_processes
 
-        return endpoints_to_processes(endpoints, base_sys_port=base_sys_port)
+        return endpoints_to_processes(endpoints, base_sys_port=base_sys_port, port_allocator=port_allocator)
 
     def build_worker_command(
         self,
@@ -240,7 +241,7 @@ class SGLangProtocol:
 
         # Get leader IP for distributed init
         leader_ip = get_hostname_ip(endpoint_nodes[0])
-        dist_init_port = 29500
+        dist_init_port = runtime.port_plan.sglang_dist_init_port_base + process.endpoint_index
 
         # Choose Python module based on frontend type
         use_sglang = frontend_type == "sglang"
