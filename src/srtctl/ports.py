@@ -51,7 +51,13 @@ class PortPlan:
 
     @classmethod
     def from_job_id(cls, job_id: str) -> PortPlan:
-        """Build a plan from a Slurm job ID, honoring an explicit slot override."""
+        """Build a non-legacy plan from a Slurm job ID.
+
+        Slot zero preserves the fixed ports used before job-scoped allocation
+        and remains available through :meth:`default` or an explicit override.
+        Slurm jobs avoid that slot because those conventional ports are more
+        likely to be occupied by workloads that do not use ``PortPlan``.
+        """
         override = os.environ.get("SRTCTL_PORT_SLOT")
         if override is not None:
             try:
@@ -63,7 +69,8 @@ class PortPlan:
         match = re.search(r"\d+", job_id)
         if match is None:
             raise ValueError(f"Cannot derive a port slot from job ID {job_id!r}")
-        return cls(slot=int(match.group()) % PORT_SLOT_COUNT)
+        nonlegacy_slot_count = PORT_SLOT_COUNT - 1
+        return cls(slot=(int(match.group()) % nonlegacy_slot_count) + 1)
 
     @property
     def offset(self) -> int:

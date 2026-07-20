@@ -23,7 +23,7 @@ def test_default_plan_preserves_legacy_ports():
 
 def test_job_id_selects_a_shared_nonzero_offset_for_every_port_family():
     plan = PortPlan.from_job_id("14084685")
-    expected_slot = 14084685 % PORT_SLOT_COUNT
+    expected_slot = (14084685 % (PORT_SLOT_COUNT - 1)) + 1
 
     assert plan.slot == expected_slot
     assert plan.offset == expected_slot * PORT_SLOT_STRIDE
@@ -46,6 +46,29 @@ def test_neighboring_jobs_select_different_plans():
     assert first.frontend_public_port != second.frontend_public_port
     assert first.dyn_system_port_base != second.dyn_system_port_base
     assert first.node_port_allocator().base_fpm_port != second.node_port_allocator().base_fpm_port
+
+
+def test_slurm_job_ids_never_select_legacy_slot_zero():
+    plan = PortPlan.from_job_id(str((PORT_SLOT_COUNT - 1) * 1234))
+
+    assert plan.slot == 1
+    assert plan.frontend_public_port != PortPlan.default().frontend_public_port
+    assert plan.dyn_system_port_base != PortPlan.default().dyn_system_port_base
+
+
+def test_regression_job_that_previously_selected_slot_zero_is_nonlegacy():
+    plan = PortPlan.from_job_id("14181944")
+
+    assert plan.slot == 6
+    assert plan.frontend_public_port == 8768
+    assert plan.dyn_system_port_base == 8849
+
+
+def test_one_slurm_slot_cycle_covers_every_nonlegacy_slot_once():
+    plans = [PortPlan.from_job_id(str(job_id)) for job_id in range(PORT_SLOT_COUNT - 1)]
+
+    assert {plan.slot for plan in plans} == set(range(1, PORT_SLOT_COUNT))
+    assert len({plan.frontend_public_port for plan in plans}) == PORT_SLOT_COUNT - 1
 
 
 def test_highest_slot_keeps_full_fpm_reservation_in_registered_range():
