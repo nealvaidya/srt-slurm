@@ -115,11 +115,12 @@ class SweepOrchestrator(
         Port defaults come from ``srtctl.ports`` and are allocated
         deterministically within a job.
         """
-        allocator = (
-            self.runtime.job_ports.allocator()
-            if self.runtime.job_ports is not None
-            else NodePortAllocator(bases={SIDECAR_GRPC_PORTS.name: self.config.dynamo.sidecar_port})
-        )
+        if self.config.job_scoped_ports:
+            if self.runtime.job_ports is None:
+                raise ValueError("job_scoped_ports requires a runtime port plan")
+            allocator = self.runtime.job_ports.allocator()
+        else:
+            allocator = NodePortAllocator(bases={SIDECAR_GRPC_PORTS.name: self.config.dynamo.sidecar_port})
         return self.config.worker_processes(self.endpoints, port_allocator=allocator)
 
     def start_head_infrastructure(self, registry: ProcessRegistry) -> None:
