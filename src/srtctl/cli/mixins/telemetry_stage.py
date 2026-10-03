@@ -565,7 +565,7 @@ class TelemetryStageMixin:
         if service_nodes is None:
             return []
         targets: list[ServiceMetricsTarget] = []
-        for entry in effective_services(self.config):
+        for entry in effective_services(self.config, self.runtime):
             service = entry.service
             if not service.enabled or service.external:
                 continue

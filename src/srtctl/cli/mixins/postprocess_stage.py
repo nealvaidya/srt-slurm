@@ -119,11 +119,18 @@ class PostProcessStageMixin:
             return None
 
     def _get_s3_config(self) -> S3Config | None:
-        """Load S3 config from cluster config (under reporting.s3).
+        """Prefer the submitted job's reporting destination over cluster defaults.
 
         Returns:
             S3Config if configured, None otherwise
         """
+        # A subsequent submission may overwrite the shared cluster config.
+        # The job recipe is immutable and belongs to this job's output tree.
+        job_reporting = getattr(self.config, "reporting", None)
+        job_s3 = getattr(job_reporting, "s3", None) if job_reporting else None
+        if job_s3:
+            return job_s3
+
         cluster_config = load_cluster_config()
         if not cluster_config:
             return None

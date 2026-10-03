@@ -282,6 +282,7 @@ def mock_infrastructure(*, options: MockOptions, output_dir: Path):
         ("srtctl.core.runtime.get_hostname_ip", _fake_hostname_ip),
         ("srtctl.core.runtime.get_slurm_nodelist", _fake_nodelist),
         ("srtctl.core.telemetry.get_hostname_ip", _fake_hostname_ip),
+        ("srtctl.services.kv_events.get_hostname_ip", _fake_hostname_ip),
         ("srtctl.cli.mixins.frontend_stage.get_hostname_ip", _fake_hostname_ip),
         ("srtctl.cli.mixins.benchmark_stage.get_hostname_ip", _fake_hostname_ip),
         ("srtctl.cli.mixins.service_stage.get_hostname_ip", _fake_hostname_ip),

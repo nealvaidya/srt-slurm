@@ -13,10 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from srtctl.core.job_ports import runtime_port
 from srtctl.core.processes import ManagedProcess
 from srtctl.core.slurm import get_hostname_ip, start_srun_process
 from srtctl.frontends import get_frontend
-from srtctl.ports import FRONTEND_INTERNAL_PORT, FRONTEND_PUBLIC_PORT
+from srtctl.ports import FRONTEND_INTERNAL_PORT
 
 if TYPE_CHECKING:
     from srtctl.core.processes import ProcessRegistry
@@ -99,8 +100,8 @@ class FrontendStageMixin:
             return FrontendTopology(
                 nginx_node=None,
                 frontend_nodes=[orchestrator_node],
-                frontend_port=FRONTEND_PUBLIC_PORT,
-                public_port=FRONTEND_PUBLIC_PORT,
+                frontend_port=self.runtime.frontend_port,
+                public_port=self.runtime.frontend_port,
             )
 
         # Multiple nodes with multiple frontends enabled:
@@ -124,8 +125,8 @@ class FrontendStageMixin:
         return FrontendTopology(
             nginx_node=head,
             frontend_nodes=frontend_nodes,
-            frontend_port=FRONTEND_INTERNAL_PORT,
-            public_port=FRONTEND_PUBLIC_PORT,
+            frontend_port=runtime_port(self.runtime, "frontend-internal", FRONTEND_INTERNAL_PORT),
+            public_port=self.runtime.frontend_port,
         )
 
     def _start_nginx(self, topology: FrontendTopology) -> ManagedProcess:

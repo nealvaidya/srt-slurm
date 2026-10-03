@@ -49,7 +49,6 @@ from srtctl.core.status import JobStage, JobStatus, LogStreamer, StatusReporter,
 from srtctl.core.topology import Endpoint, NodePortAllocator, Process, allocate_endpoints_het
 from srtctl.logging_utils import setup_logging
 from srtctl.ports import (
-    FRONTEND_PUBLIC_PORT,
     SIDECAR_GRPC_PORTS,
 )
 from srtctl.services.implicit import uses_discovery_plane
@@ -116,7 +115,11 @@ class SweepOrchestrator(
         Port defaults come from ``srtctl.ports`` and are allocated
         deterministically within a job.
         """
-        allocator = NodePortAllocator(bases={SIDECAR_GRPC_PORTS.name: self.config.dynamo.sidecar_port})
+        allocator = (
+            self.runtime.job_ports.allocator()
+            if self.runtime.job_ports is not None
+            else NodePortAllocator(bases={SIDECAR_GRPC_PORTS.name: self.config.dynamo.sidecar_port})
+        )
         return self.config.worker_processes(self.endpoints, port_allocator=allocator)
 
     def start_head_infrastructure(self, registry: ProcessRegistry) -> None:
@@ -168,7 +171,7 @@ class SweepOrchestrator(
         logger.info("Connection Commands")
         logger.info("=" * 60)
         if self.config.frontend.type != "none":
-            logger.info("Frontend URL: http://%s:%d", self._public_api_node(), FRONTEND_PUBLIC_PORT)
+            logger.info("Frontend URL: http://%s:%d", self._public_api_node(), self.runtime.frontend_port)
         logger.info("")
         logger.info("To connect to head node (%s):", self.runtime.nodes.head)
         logger.info(
@@ -504,7 +507,7 @@ class SweepOrchestrator(
                 logger.error("Server did not become healthy for eval")
                 return 1
         else:
-            if not wait_for_port(self._public_api_node(), FRONTEND_PUBLIC_PORT, timeout=30):
+            if not wait_for_port(self._public_api_node(), self.runtime.frontend_port, timeout=30):
                 logger.error("Server health check failed before eval - skipping")
                 return 1
 
@@ -752,6 +755,19 @@ class SweepOrchestrator(
             exit_code = self.finalize_cpu_power_host_telemetry(exit_code, interrupted=stop_event.is_set())
             stop_event.set()
             registry.cleanup()
+            # Required service artifacts are finalized only after worker drain.
+            from srtctl.services.implicit import effective_services
+            from srtctl.services.registry import get_service_kind
+
+            for entry in effective_services(self.config):
+                service = entry.service
+                if service.enabled and not service.external:
+                    try:
+                        get_service_kind(service.type).finalize(service, self.runtime)
+                    except Exception:
+                        logger.exception("Service %s artifact finalization failed", service.name)
+                        if service.effective_critical:
+                            exit_code = 1
             # After cleanup so the GPUs are idle before node state is reverted.
             self._run_host_teardown()
             if exit_code != 0:

@@ -24,6 +24,7 @@ from .slurm import get_hostname_ip, get_slurm_het_nodelists, get_slurm_nodelist
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from srtctl.core.job_ports import JobPortPlan
     from srtctl.core.schema import DynamoConfig, SrtConfig
 
 
@@ -355,6 +356,7 @@ class RuntimeContext:
 
     # Frontend port (for benchmark endpoint)
     frontend_port: int = FRONTEND_PUBLIC_PORT
+    job_ports: "JobPortPlan | None" = None
 
     # Optional lustre->node-local model staging (see model.stage_dir)
     stage_dir: str | None = None
@@ -577,6 +579,15 @@ class RuntimeContext:
             container_path = container_template.get_path(temp_context, make_absolute=False, ensure_exists=False)
             container_mounts[host_path] = container_path
 
+        job_ports = None
+        if config.job_scoped_ports:
+            import json
+
+            from srtctl.core.job_ports import JobPortPlan
+
+            job_ports = JobPortPlan.from_job_id(job_id)
+            (log_dir / "port_plan.json").write_text(json.dumps(job_ports.to_dict(), indent=2) + "\n")
+
         return cls(
             job_id=job_id,
             run_name=run_name,
@@ -598,6 +609,8 @@ class RuntimeContext:
             staged_model_path=staged_model_path,
             request_plane=config.dynamo.request_plane,
             dynamo=config.dynamo,
+            job_ports=job_ports,
+            frontend_port=job_ports.fixed("frontend") if job_ports is not None else FRONTEND_PUBLIC_PORT,
         )
 
     @property

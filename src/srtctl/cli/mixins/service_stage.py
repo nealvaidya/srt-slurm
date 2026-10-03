@@ -348,9 +348,11 @@ class ServiceStageMixin:
             log_file=log_file,
             node=ctx.node,
             critical=service.effective_critical,
-            terminate_timeout=SERVICE_TERMINATE_TIMEOUT_SECONDS,
+            terminate_timeout=kind.terminate_timeout or SERVICE_TERMINATE_TIMEOUT_SECONDS,
             step_name=step_name,
-            shutdown_tier=_SHUTDOWN_TIER[service.effective_start],
+            shutdown_tier=kind.shutdown_tier
+            if kind.shutdown_tier is not None
+            else _SHUTDOWN_TIER[service.effective_start],
         )
 
     @staticmethod
@@ -401,7 +403,7 @@ class ServiceStageMixin:
         and raises. The started processes are also returned. A service with
         ``external`` set launches nothing; its address is injected instead.
         """
-        effective = [entry for entry in effective_services(self.config) if not entry.service.external]
+        effective = [entry for entry in effective_services(self.config, self.runtime) if not entry.service.external]
         phase = [entry for entry in effective if entry.service.effective_start == start]
         if not phase:
             return []
@@ -455,6 +457,7 @@ class ServiceStageMixin:
                         node_ips=node_ips,
                         process=process,
                         config=self.config,
+                        processes=tuple(self.backend_processes),
                     )
                     proc = self._launch_service_instance(service, ctx, work_dir, len(placed))
                     started.append(proc)

@@ -112,6 +112,7 @@ def test_registered_kinds() -> None:
         "etcd",
         "generic",
         "gms",
+        "kv-events",
         "lmcache-server",
         "mooncake-master",
         "mooncake-store",

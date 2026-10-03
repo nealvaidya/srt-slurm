@@ -21,7 +21,9 @@ from typing import TYPE_CHECKING
 
 from marshmallow import ValidationError
 
-from srtctl.ports import ETCD_CLIENT_PORT, NATS_PORT
+from srtctl.core.job_ports import runtime_port
+from srtctl.ports import ETCD_CLIENT_PORT, ETCD_PEER_PORT, NATS_PORT
+from srtctl.services.config import ServiceReadinessConfig, TcpProbe
 from srtctl.services.registry import ServiceKind, ServiceLaunchContext, register_service
 
 if TYPE_CHECKING:
@@ -45,6 +47,14 @@ class _InfraKind(ServiceKind):
     supports_dedicated = True
     supports_external = True
 
+    def readiness(self, service, ctx):
+        if getattr(ctx.runtime, "job_ports", None) is None:
+            return None
+        name = "etcd-client" if self.type_name == "etcd" else "nats"
+        return ServiceReadinessConfig(
+            tcp=TcpProbe(port=ctx.runtime.job_ports.fixed(name)), timeout_seconds=INFRA_READINESS_TIMEOUT
+        )
+
     def validate(self, service: ServiceConfig, config: SrtConfig) -> None:
         if service.effective_placement not in ("head", "infra", "dedicated"):
             raise ValidationError(
@@ -62,20 +72,35 @@ class EtcdService(_InfraKind):
     def build_command(self, service: ServiceConfig, ctx: ServiceLaunchContext) -> list[str]:
         if service.command is not None:
             return list(service.effective_command)
+        client_port = runtime_port(ctx.runtime, "etcd-client", ETCD_CLIENT_PORT)
+        data_dir = _job_path(ctx, ETCD_DATA_DIR)
+        peer_args = []
+        if getattr(ctx.runtime, "job_ports", None) is not None:
+            peer = runtime_port(ctx.runtime, "etcd-peer", ETCD_PEER_PORT)
+            peer_args = [
+                "--listen-peer-urls",
+                f"http://0.0.0.0:{peer}",
+                "--initial-advertise-peer-urls",
+                f"http://{ctx.node_ip}:{peer}",
+                "--initial-cluster",
+                f"default=http://{ctx.node_ip}:{peer}",
+            ]
         return [
             ETCD_BINARY,
             "--data-dir",
-            ETCD_DATA_DIR,
+            data_dir,
             "--listen-client-urls",
-            f"http://0.0.0.0:{ETCD_CLIENT_PORT}",
+            f"http://0.0.0.0:{client_port}",
             "--advertise-client-urls",
-            f"http://{ctx.node_ip}:{ETCD_CLIENT_PORT}",  # a reachable IP, never 0.0.0.0
+            f"http://{ctx.node_ip}:{client_port}",  # a reachable IP, never 0.0.0.0
+            *peer_args,
             *service.args,
         ]
 
     def preamble(self, service: ServiceConfig, ctx: ServiceLaunchContext) -> str | None:
         # Fresh data dir on node-local disk: stale Raft state from an earlier job breaks startup.
-        return f"rm -rf {ETCD_DATA_DIR} && mkdir -p {ETCD_DATA_DIR}"
+        data_dir = shlex.quote(_job_path(ctx, ETCD_DATA_DIR))
+        return f"rm -rf {data_dir} && mkdir -p {data_dir}"
 
 
 @register_service("nats")
@@ -92,17 +117,23 @@ class NatsService(_InfraKind):
     def build_command(self, service: ServiceConfig, ctx: ServiceLaunchContext) -> list[str]:
         if service.command is not None:
             return list(service.effective_command)
+        port_args = (
+            ["-p", str(runtime_port(ctx.runtime, "nats", NATS_PORT))]
+            if getattr(ctx.runtime, "job_ports", None) is not None
+            else []
+        )
         if service.options.get("max_payload_mb") is not None:
-            return [NATS_BINARY, "-c", NATS_CONFIG_PATH, *service.args]
-        return [NATS_BINARY, "-js", "-sd", NATS_STORE_DIR, *service.args]
+            return [NATS_BINARY, "-c", _job_path(ctx, NATS_CONFIG_PATH), *port_args, *service.args]
+        return [NATS_BINARY, "-js", "-sd", _job_path(ctx, NATS_STORE_DIR), *port_args, *service.args]
 
     def preamble(self, service: ServiceConfig, ctx: ServiceLaunchContext) -> str | None:
-        parts = [f"rm -rf {NATS_STORE_DIR} && mkdir -p {NATS_STORE_DIR}"]
+        store_dir = _job_path(ctx, NATS_STORE_DIR)
+        parts = [f"rm -rf {shlex.quote(store_dir)} && mkdir -p {shlex.quote(store_dir)}"]
         max_payload_mb = service.options.get("max_payload_mb")
         if max_payload_mb is not None:
             max_payload_bytes = int(max_payload_mb) * 1024 * 1024
-            conf = f'max_payload: {max_payload_bytes}\njetstream {{ store_dir: "{NATS_STORE_DIR}" }}\n'
-            parts.append(f"printf %s {shlex.quote(conf)} > {NATS_CONFIG_PATH}")
+            conf = f'max_payload: {max_payload_bytes}\njetstream {{ store_dir: "{store_dir}" }}\n'
+            parts.append(f"printf %s {shlex.quote(conf)} > {shlex.quote(_job_path(ctx, NATS_CONFIG_PATH))}")
         return " && ".join(parts)
 
     def validate(self, service: ServiceConfig, config: SrtConfig) -> None:
@@ -110,3 +141,11 @@ class NatsService(_InfraKind):
         max_payload_mb = service.options.get("max_payload_mb")
         if max_payload_mb is not None and (not isinstance(max_payload_mb, int) or max_payload_mb <= 0):
             raise ValidationError(f"services[{service.name}].options.max_payload_mb must be a positive integer")
+
+
+def _job_path(ctx, default):
+    if getattr(ctx.runtime, "job_ports", None) is not None:
+        from pathlib import PurePosixPath
+
+        return f"/tmp/srtctl-{ctx.runtime.job_id}/{PurePosixPath(default).name}"
+    return default

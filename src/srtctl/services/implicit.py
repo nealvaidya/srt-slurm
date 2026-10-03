@@ -14,10 +14,11 @@ list to the service stage and to dry-run, which marks the implicit ones.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from srtctl.backends.vllm import VLLMMooncakeKVStoreConfig, VLLMProtocol
+from srtctl.core.job_ports import runtime_port
 from srtctl.ports import ETCD_CLIENT_PORT, NATS_PORT
 from srtctl.services.config import ServiceConfig, ServicePlacementConfig
 
@@ -221,7 +222,7 @@ def implied_services(config: SrtConfig) -> list[EffectiveService]:
     return implied
 
 
-def effective_services(config: SrtConfig) -> list[EffectiveService]:
+def effective_services(config: SrtConfig, runtime: RuntimeContext | None = None) -> list[EffectiveService]:
     """Implicit services first (a declared one of the same name replaces it), then the declared ones.
 
     Disabled entries (``enabled: false``) are dropped, which is how a recipe
@@ -240,6 +241,14 @@ def effective_services(config: SrtConfig) -> list[EffectiveService]:
         if service.name in seen or not service.enabled:
             continue
         effective.append(EffectiveService(service, implicit=False))
+    plan = getattr(runtime, "job_ports", None)
+    if plan is not None:
+        for index, entry in enumerate(effective):
+            if entry.service.type in ("dcgm-exporter", "node-exporter", "process-exporter"):
+                service = replace(
+                    entry.service, options={**entry.service.options, "port": plan.fixed(entry.service.type)}
+                )
+                effective[index] = replace(entry, service=service)
     return effective
 
 
@@ -267,11 +276,12 @@ def discovery_env(config: SrtConfig, runtime: RuntimeContext) -> dict[str, str]:
     """
     env = {
         "ETCD_ENDPOINTS": _declared_external(config, ETCD_SERVICE_NAME)
-        or f"http://{runtime.infra_node_ip}:{ETCD_CLIENT_PORT}"
+        or f"http://{runtime.infra_node_ip}:{runtime_port(runtime, 'etcd-client', ETCD_CLIENT_PORT)}"
     }
     if runs_nats(config):
         env["NATS_SERVER"] = (
-            _declared_external(config, NATS_SERVICE_NAME) or f"nats://{runtime.infra_node_ip}:{NATS_PORT}"
+            _declared_external(config, NATS_SERVICE_NAME)
+            or f"nats://{runtime.infra_node_ip}:{runtime_port(runtime, 'nats', NATS_PORT)}"
         )
     return env
 

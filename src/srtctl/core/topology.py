@@ -64,6 +64,7 @@ class NodePortAllocator:
     """
 
     bases: dict[str, int] = field(default_factory=dict)
+    limits: dict[str, int] = field(default_factory=dict)
     _next: dict[tuple[str, str | None], int] = field(default_factory=dict, repr=False)
 
     def next(self, kind: PortKind, node: str | None = None, size: int = 1) -> int:
@@ -83,7 +84,7 @@ class NodePortAllocator:
         self._next[key] = ordinal + size
         port = self.bases.get(kind.name, kind.base) + ordinal * kind.stride
         last = port + (size - 1) * kind.stride
-        if last > 65535:
+        if last >= self.limits.get(kind.name, 65536):
             raise ValueError(f"{kind.name} port range exhausted at {port}..{last}")
         return port
 
@@ -203,6 +204,16 @@ class Process:
     def is_leader(self) -> bool:
         """Whether this is the leader process for the endpoint."""
         return self.node_rank == 0
+
+    def kv_events_listener(self, local_rank: int = 0) -> int:
+        """A listener inside this process's allocator-reserved local DP block."""
+        if self.kv_events_port is None:
+            raise ValueError("KV-event publisher has no allocated port")
+        return self.kv_events_port + local_rank
+
+    def vllm_kv_events_base(self, global_dp_rank: int) -> int:
+        """Undo vLLM's global-rank offset so it binds the allocated listener."""
+        return self.kv_events_listener() - global_dp_rank
 
     @property
     def engine_suffix(self) -> str:

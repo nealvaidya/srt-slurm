@@ -13,6 +13,7 @@ This module consolidates all SLURM-related functionality:
 
 import logging
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -22,6 +23,19 @@ from pathlib import Path
 from .ip_utils import get_node_ip
 
 logger = logging.getLogger(__name__)
+
+_SENSITIVE_ENV_NAME = re.compile(r"(?:token|secret|password|credential|(?:api|access|private)[_-]?key)", re.IGNORECASE)
+
+
+def _command_for_log(command: list[str], env_to_set: dict[str, str] | None) -> str:
+    """Redact credential values before shell quoting a command for logging."""
+    safe_command = list(command)
+    for name, value in (env_to_set or {}).items():
+        if value and _SENSITIVE_ENV_NAME.search(name):
+            safe_command = [
+                arg.replace(shlex.quote(value), "<redacted>").replace(value, "<redacted>") for arg in safe_command
+            ]
+    return shlex.join(safe_command)
 
 
 def _get_cluster_bash_preamble() -> str | None:
@@ -356,7 +370,7 @@ def start_srun_process(
             logger.warning(
                 "Cluster default_bash_preamble is set but this srun bypasses the bash wrapper "
                 "(use_bash_wrapper=False); preamble will not be applied. command=%s",
-                shlex.join(command),
+                _command_for_log(command, env_to_set),
             )
         srun_cmd.extend(command)
 
@@ -364,7 +378,7 @@ def start_srun_process(
     # fingerprint heredoc is inlined (see core/fingerprint.generate_capture_script),
     # which dominates the orchestrator log. Re-enable with `--verbose` / by setting
     # the srtctl logger to DEBUG when troubleshooting srun arg construction.
-    logger.debug("srun command: %s", shlex.join(srun_cmd))
+    logger.debug("srun command: %s", _command_for_log(srun_cmd, {**(env_to_set or {}), **(srun_export_env or {})}))
 
     # Start the process
     proc = subprocess.Popen(

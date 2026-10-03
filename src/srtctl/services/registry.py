@@ -43,6 +43,8 @@ class ServiceLaunchContext:
     # The whole recipe, for kinds whose launch depends on facts outside their own block
     # (the GMS kind reads ``engine.failover``); None in previews.
     config: SrtConfig | None = None
+    # The allocated fleet; a head-placed recorder subscribes to every publisher.
+    processes: tuple[Process, ...] = ()
 
     @classmethod
     def preview(cls, node: str = "<node>") -> ServiceLaunchContext:
@@ -144,6 +146,8 @@ class ServiceKind:
     # True when the kind assembles its own command in ``build_command`` (etcd, the
     # exporters, ...), so the recipe need not give one.
     builds_command: ClassVar[bool] = False
+    shutdown_tier: ClassVar[int | None] = None
+    terminate_timeout: ClassVar[float | None] = None
 
     def validate(self, service: ServiceConfig, config: SrtConfig) -> None:
         """Whole-recipe checks for one service (raise ``marshmallow.ValidationError``)."""
@@ -203,6 +207,9 @@ class ServiceKind:
         exporters) return their own default when the recipe writes none.
         """
         return list(service.metrics)
+
+    def finalize(self, service: ServiceConfig, runtime: RuntimeContext) -> None:
+        """Validate durable outputs after all managed processes have stopped."""
 
 
 _SERVICE_KINDS: dict[str, ServiceKind] = {}

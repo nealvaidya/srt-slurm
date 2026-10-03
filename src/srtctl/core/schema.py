@@ -2400,6 +2400,7 @@ class SrtConfig:
     )
 
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
+    job_scoped_ports: bool = False
     # The engine every role runs: a type (`sglang`) or a mapping with `type` plus engine-wide
     # knobs (see the engine types). Omit it when every role declares its own `engine`.
     engine: Annotated[BackendConfig | None, BackendConfigField(allow_none=True, reject_per_role_keys=True)] = None
@@ -2455,6 +2456,19 @@ class SrtConfig:
         """Validate configuration after initialization."""
         self._validate_roles()
         _ = self.backend  # bind the roles onto the engine now, so a bad role setting fails at load
+        if self.job_scoped_ports and (
+            not isinstance(self.backend, VLLMProtocol)
+            or self.frontend.type != "dynamo"
+            or set(self.roles) != {"agg"}
+            or self.roles["agg"].nodes != 1
+            or self.dynamo.sidecar
+            or self.backend.failover is not None
+            or self.backend.mooncake_kv_store is not None
+            or self.backend.connector is not None
+        ):
+            raise ValueError(
+                "job_scoped_ports requires single-node aggregate Dynamo vLLM without sidecars or shadow engines"
+            )
         self._validate_role_backends()
         self._validate_frontend_worker_selection()
         self._validate_profiling()

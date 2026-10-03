@@ -1451,7 +1451,10 @@ class VLLMProtocol:
 
         kv_cfg = self.get_kv_events_config_for_mode(mode)
         if kv_cfg and process.kv_events_port is not None:
-            kv_cfg["endpoint"] = f"tcp://*:{process.kv_events_port}"
+            # vLLM adds its global DP rank to the publisher endpoint. The
+            # allocator already reserved the actual listener port/block.
+            dp_rank = process.node_rank if self._is_dp_mode(mode) else 0
+            kv_cfg["endpoint"] = f"tcp://*:{process.vllm_kv_events_base(dp_rank)}"
             cmd.extend(["--kv-events-config", json.dumps(kv_cfg)])
 
         # Add all config flags from the role's args
