@@ -10,10 +10,15 @@ This branch starts at upstream 898e695b5b5c358e90915c361ad7c97d28e7edde
   The measured replay preserves workload parameters.
 - `job_scoped_ports: true` assigns bounded port slots for the supported
   single-node aggregate Dynamo/vLLM deployment. Infrastructure state directories
-  also include the job ID. Slots 1 through 15 are deterministic, not a lease;
-  job IDs congruent modulo 15 can collide. Choose distinct `SRTCTL_PORT_SLOT`
-  values for such concurrent jobs. Unsupported deployments fail validation.
-  This does not guarantee isolation from older jobs using arbitrary ports.
+  also include the job ID. Slots 1 through 15 are deterministic. A private,
+  node-local user lock holds the slot until orchestration and process cleanup
+  finish. Jobs congruent modulo 15 fail before launching services when that
+  slot is already held; choose distinct `SRTCTL_PORT_SLOT` values or resubmit.
+  Kernel process exit releases the lock, including after crashes. The lease
+  does not change the locked recipe's port assignment. Occupied infrastructure
+  ports also fail before discovery-plane startup. Unsupported deployments fail
+  validation. Other users and older jobs do not participate in this user lock;
+  it cannot guarantee isolation against their concurrent use of arbitrary ports.
 - `services[].type: kv-events` runs a required head-node recorder independently
   from native metrics and FPM. Every worker role must publish KV events. Source
   endpoints follow allocated listener blocks, including local DP ranks and

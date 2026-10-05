@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-from unittest.mock import patch
+import socket
+import subprocess
+import sys
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -46,3 +49,78 @@ def test_slot_override_and_invalid_ids_are_explicit():
         JobPortPlan.from_job_id("123")
     with patch.dict("os.environ", {}, clear=True), pytest.raises(ValueError):
         JobPortPlan.from_job_id("unknown")
+
+
+def test_slot_lease_rejects_another_process_and_releases_on_failure(tmp_path):
+    directory = tmp_path / "leases"
+    plan = JobPortPlan(1)
+    code = (
+        "from pathlib import Path; from srtctl.core.job_ports import JobPortPlan; "
+        f"ctx=JobPortPlan(1).lease('115', directory=Path({str(directory)!r})); ctx.__enter__()"
+    )
+    with pytest.raises(ValueError, match="test failure"), plan.lease("100", directory=directory):
+        child = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+        assert child.returncode != 0
+        assert "already leased by job 100" in child.stderr
+        with JobPortPlan(2).lease("101", directory=directory):
+            pass
+        raise ValueError("test failure")
+    # Retained inode is safe to reuse, with no stale-job ownership after exit.
+    with plan.lease("115", directory=directory):
+        assert (directory / "slot-1.lock").read_text() == "job 115\n"
+
+
+def test_slot_lease_rejects_occupied_infrastructure_port_and_releases_lock(tmp_path):
+    plan = JobPortPlan(1)
+    with socket.socket() as listener:
+        listener.bind(("0.0.0.0", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        with (
+            patch("srtctl.core.job_ports.FIXED_KINDS", ("frontend",)),
+            patch.object(JobPortPlan, "fixed", return_value=port),
+            pytest.raises(RuntimeError, match="frontend port .* unavailable"),
+            plan.lease("100", directory=tmp_path / "leases"),
+        ):
+            pytest.fail("occupied listener must fail before startup")
+    with plan.lease("100", directory=tmp_path / "leases"):
+        pass
+
+
+def test_slot_lease_rejects_nonprivate_directory(tmp_path):
+    directory = tmp_path / "public"
+    directory.mkdir(mode=0o755)
+    with pytest.raises(RuntimeError, match="must be private"), JobPortPlan(1).lease("100", directory=directory):
+        pass
+
+
+def test_cli_holds_slot_until_orchestrator_returns(tmp_path):
+    from srtctl.cli.do_sweep import main
+
+    config_path = tmp_path / "recipe.yaml"
+    config_path.touch()
+    plan = JobPortPlan(1)
+    directory = tmp_path / "leases"
+    config = Mock(job_scoped_ports=True)
+
+    def run():
+        with pytest.raises(RuntimeError, match="already leased"), plan.lease("115", directory=directory):
+            pytest.fail("orchestrator must own the slot through cleanup")
+        return 0
+
+    with (
+        patch.object(sys, "argv", ["do_sweep", str(config_path)]),
+        patch("srtctl.cli.do_sweep.load_config", return_value=config),
+        patch("srtctl.cli.do_sweep.get_slurm_job_id", return_value="100"),
+        patch("srtctl.cli.do_sweep.RuntimeContext.from_config"),
+        patch(
+            "srtctl.cli.do_sweep.JobPortPlan.from_job_id",
+            return_value=Mock(lease=lambda job: plan.lease(job, directory=directory)),
+        ),
+        patch("srtctl.cli.do_sweep.SweepOrchestrator", return_value=Mock(run=run)),
+        pytest.raises(SystemExit) as exited,
+    ):
+        main()
+    assert exited.value.code == 0
+    with plan.lease("115", directory=directory):
+        pass

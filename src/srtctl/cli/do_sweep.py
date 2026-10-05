@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from srtctl.cli.mixins import (
 )
 from srtctl.core.config import load_config
 from srtctl.core.health import wait_for_port
+from srtctl.core.job_ports import JobPortPlan
 from srtctl.core.lockfile import write_lockfile
 from srtctl.core.processes import (
     ProcessRegistry,
@@ -833,9 +835,11 @@ def main():
 
         # Type narrowing: job_id is str after the check above
         assert job_id is not None
-        runtime = RuntimeContext.from_config(config, job_id)
-        orchestrator = SweepOrchestrator(config=config, runtime=runtime, serve_only=args.serve_only)
-        exit_code = orchestrator.run()
+        lease = JobPortPlan.from_job_id(job_id).lease(job_id) if config.job_scoped_ports else nullcontext()
+        with lease:
+            runtime = RuntimeContext.from_config(config, job_id)
+            orchestrator = SweepOrchestrator(config=config, runtime=runtime, serve_only=args.serve_only)
+            exit_code = orchestrator.run()
 
         sys.exit(exit_code)
 

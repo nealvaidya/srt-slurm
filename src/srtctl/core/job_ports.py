@@ -2,13 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in, bounded port slots for co-located CLU Dynamo/vLLM jobs.
 
-Slots are deterministic, not an inter-job lease. Explicit SRTCTL_PORT_SLOT can
-separate concurrent jobs whose numeric IDs select the same slot.
+Slots are deterministic. A node-local lease rejects overlapping slots owned by
+the same user before infrastructure starts; it does not reassign locked ports.
 """
 
+import fcntl
 import os
 import re
+import socket
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 from srtctl import ports
 from srtctl.core.topology import NodePortAllocator
@@ -89,6 +94,48 @@ class JobPortPlan:
             "fixed": {name: self.fixed(name) for name in FIXED_KINDS},
             "worker_ranges": {key: {"base": base, "size": size} for key, (base, size) in self.worker_ranges().items()},
         }
+
+    @contextmanager
+    def lease(self, job_id: str, *, directory: Path | None = None) -> Iterator[None]:
+        """Hold the slot through process cleanup; kernel exit also releases it.
+
+        The directory must be node-local, never the shared job output directory.
+        Files are retained to avoid unlinking a lock another process has opened.
+        """
+        directory = directory or Path(f"/tmp/srtctl-port-slots-{os.getuid()}")
+        directory.mkdir(mode=0o700, exist_ok=True)
+        info = directory.lstat()
+        if not directory.is_dir() or directory.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise RuntimeError(f"port-slot lease directory must be private and owned by this user: {directory}")
+        fd = os.open(directory / f"slot-{self.slot}.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "r+") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                owner = lock.read().strip() or "unknown job"
+                raise RuntimeError(
+                    f"port slot {self.slot} is already leased by {owner}; choose SRTCTL_PORT_SLOT"
+                ) from exc
+            try:
+                # Avoid attaching to another user's discovery plane already
+                # listening in this slot. Other users do not share our lease.
+                for name in FIXED_KINDS:
+                    with socket.socket() as probe:
+                        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        try:
+                            probe.bind(("0.0.0.0", self.fixed(name)))
+                            probe.listen(1)
+                        except OSError as exc:
+                            raise RuntimeError(
+                                f"port slot {self.slot}: {name} port {self.fixed(name)} unavailable"
+                            ) from exc
+                lock.seek(0)
+                lock.truncate()
+                lock.write(f"job {job_id}\n")
+                lock.flush()
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def runtime_port(runtime, name, default):
