@@ -58,7 +58,11 @@ def test_slot_lease_rejects_another_process_and_releases_on_failure(tmp_path):
         "from pathlib import Path; from srtctl.core.job_ports import JobPortPlan; "
         f"ctx=JobPortPlan(1).lease('115', directory=Path({str(directory)!r})); ctx.__enter__()"
     )
-    with pytest.raises(ValueError, match="test failure"), plan.lease("100", directory=directory):
+    with (
+        patch("srtctl.core.job_ports.FIXED_KINDS", ()),
+        pytest.raises(ValueError, match="test failure"),
+        plan.lease("100", directory=directory),
+    ):
         child = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
         assert child.returncode != 0
         assert "already leased by job 100" in child.stderr
@@ -66,7 +70,7 @@ def test_slot_lease_rejects_another_process_and_releases_on_failure(tmp_path):
             pass
         raise ValueError("test failure")
     # Retained inode is safe to reuse, with no stale-job ownership after exit.
-    with plan.lease("115", directory=directory):
+    with patch("srtctl.core.job_ports.FIXED_KINDS", ()), plan.lease("115", directory=directory):
         assert (directory / "slot-1.lock").read_text() == "job 115\n"
 
 
@@ -83,7 +87,7 @@ def test_slot_lease_rejects_occupied_infrastructure_port_and_releases_lock(tmp_p
             plan.lease("100", directory=tmp_path / "leases"),
         ):
             pytest.fail("occupied listener must fail before startup")
-    with plan.lease("100", directory=tmp_path / "leases"):
+    with patch("srtctl.core.job_ports.FIXED_KINDS", ()), plan.lease("100", directory=tmp_path / "leases"):
         pass
 
 
@@ -109,6 +113,7 @@ def test_cli_holds_slot_until_orchestrator_returns(tmp_path):
         return 0
 
     with (
+        patch("srtctl.core.job_ports.FIXED_KINDS", ()),
         patch.object(sys, "argv", ["do_sweep", str(config_path)]),
         patch("srtctl.cli.do_sweep.load_config", return_value=config),
         patch("srtctl.cli.do_sweep.get_slurm_job_id", return_value="100"),
@@ -122,5 +127,5 @@ def test_cli_holds_slot_until_orchestrator_returns(tmp_path):
     ):
         main()
     assert exited.value.code == 0
-    with plan.lease("115", directory=directory):
+    with patch("srtctl.core.job_ports.FIXED_KINDS", ()), plan.lease("115", directory=directory):
         pass
