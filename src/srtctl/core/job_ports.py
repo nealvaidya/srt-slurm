@@ -19,7 +19,7 @@ from srtctl import ports
 from srtctl.core.topology import NodePortAllocator
 
 SLOT_COUNT = 16
-FIXED_BASE = 9000
+FIXED_BASE = 10000
 WORKER_BASE = 12000
 FIXED_KINDS = (
     "etcd-client",
