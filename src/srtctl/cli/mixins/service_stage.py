@@ -34,12 +34,15 @@ healthy). See ``docs/services.md``.
 
 from __future__ import annotations
 
+import json
 import logging
 import shlex
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from srtctl.core.job_ports import PortConflict
+from srtctl.core.port_reservation import service_bind_conflict
 from srtctl.core.processes import ManagedProcess, ProcessRegistry, terminate_and_reap
 from srtctl.core.readiness import ProcessDied, wait_until_ready
 from srtctl.core.slurm import get_hostname_ip, start_srun_process
@@ -444,31 +447,76 @@ class ServiceStageMixin:
                         "workers" if service.effective_per == "worker" else "nodes",
                     )
                     continue
-                instances: list[ManagedProcess] = []
-                for index, (node, process) in enumerate(placed):
-                    ctx = ServiceLaunchContext(
-                        runtime=self.runtime,
-                        node=node,
-                        node_ip=ip_of[node],
-                        node_id=worker_order.get(node, index),
-                        index=index,
-                        role=service.effective_placement,
-                        nodes=tuple(nodes),
-                        node_ips=node_ips,
-                        process=process,
-                        config=self.config,
-                        processes=tuple(self.backend_processes),
-                    )
-                    proc = self._launch_service_instance(service, ctx, work_dir, len(placed))
-                    started.append(proc)
-                    instances.append(proc)
-                    if registry is not None:
-                        registry.add_process(proc)
-                    self._wait_service_ready(proc, service, ctx)
-                    if service.terminal:
-                        # The manual loop in BenchmarkStageMixin ends the job when these exit.
-                        self.terminal_processes.setdefault(service.name, []).append(proc)
-                kind.wait_fleet_ready(service, self.runtime, instances)
+                for attempt in range(4):
+                    instances: list[ManagedProcess] = []
+                    try:
+                        for index, (node, process) in enumerate(placed):
+                            ctx = ServiceLaunchContext(
+                                runtime=self.runtime,
+                                node=node,
+                                node_ip=ip_of[node],
+                                node_id=worker_order.get(node, index),
+                                index=index,
+                                role=service.effective_placement,
+                                nodes=tuple(nodes),
+                                node_ips=node_ips,
+                                process=process,
+                                config=self.config,
+                                processes=tuple(self.backend_processes),
+                            )
+                            proc = self._launch_service_instance(service, ctx, work_dir, len(placed))
+                            # Startup failures are handled here before the crash monitor owns them.
+                            proc.critical = False
+                            started.append(proc)
+                            instances.append(proc)
+                            if registry is not None:
+                                registry.add_process(proc)
+                            self._wait_service_ready(proc, service, ctx)
+                        kind.wait_fleet_ready(service, self.runtime, instances)
+                        for proc in instances:
+                            proc.critical = service.effective_critical
+                        if service.terminal:
+                            self.terminal_processes.setdefault(service.name, []).extend(instances)
+                        break
+                    except RuntimeError as exc:
+                        plan = self.runtime.job_ports
+                        conflict = isinstance(exc, PortConflict) or service_bind_conflict(instances)
+                        if plan is None or not conflict or attempt == 3:
+                            raise
+                        if not any(request.owner == f"service:{service.name}" for request in plan.requests.values()):
+                            raise
+                        for proc in instances:
+                            proc.critical = False
+                            proc.terminate()
+                        if any(proc.is_running for proc in instances):
+                            raise RuntimeError(f"Cannot retry services[{service.name}]: cleanup incomplete") from exc
+                        with (self.runtime.log_dir / "port_allocation_attempts.jsonl").open("a") as stream:
+                            stream.write(
+                                json.dumps(
+                                    {
+                                        "status": "service_bind_retry",
+                                        "service": service.name,
+                                        "attempt": attempt + 1,
+                                        "slot": plan.slot,
+                                        "message": str(exc),
+                                    }
+                                )
+                                + "\n"
+                            )
+                        if not plan.reassign(f"service:{service.name}"):
+                            raise
+                        for proc in instances:
+                            started.remove(proc)
+                            if proc.log_file is not None and proc.log_file.exists():
+                                archived = proc.log_file.with_suffix(f".port-attempt-{attempt + 1}.out")
+                                proc.log_file.rename(archived)
+                                proc.log_file = archived
+                        logger.warning(
+                            "Retrying services[%s] after port conflict (attempt %s/4): %s",
+                            service.name,
+                            attempt + 2,
+                            exc,
+                        )
                 logger.info("Service %s ready: %d instance(s) on %d node(s)", service.name, len(placed), len(nodes))
         except BaseException:
             # Belt and braces: the registry already tracks these, but terminate

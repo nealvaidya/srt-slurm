@@ -97,10 +97,14 @@ class PortKind:
     carried on ``Process``; nothing derives a port from another port.
     """
 
+    # span is the actual listener footprint at each allocation, independent of spacing.
+    # bounded=False records an engine scan hint without claiming it obeys a boundary.
     name: str
     base: int
     stride: int = 1
     per_node: bool = False
+    span: int = 1
+    bounded: bool = True
 
 
 # Bound on every worker process.
@@ -111,12 +115,12 @@ KV_EVENTS_PORTS = PortKind("kv_events", KV_EVENTS_PORT_BASE)
 NIXL_PORTS = PortKind("nixl", VLLM_NIXL_PORT_BASE)
 DP_RPC_PORTS = PortKind("dp_rpc", VLLM_DATA_PARALLEL_RPC_PORT, per_node=True)
 # KVBM leader ZMQ pair: pub at the port, ack at the port + 1.
-KVBM_ZMQ_PORTS = PortKind("kvbm_zmq", KVBM_ZMQ_PORT_BASE, 2)
+KVBM_ZMQ_PORTS = PortKind("kvbm_zmq", KVBM_ZMQ_PORT_BASE, 2, span=2)
 SIDECAR_GRPC_PORTS = PortKind("sidecar_grpc", DYNAMO_SIDECAR_GRPC_PORT)
 # Engine-specific: the backend allocates these for its own processes.
 NCCL_PORTS = PortKind("nccl", SGLANG_NCCL_PORT_BASE)
 DIST_INIT_PORTS = PortKind("dist_init", SGLANG_DIST_INIT_PORT_BASE, per_node=True)
-VLLM_SCAN_PORTS = PortKind("vllm_scan", VLLM_PORT_BASE, VLLM_PORT_STRIDE)
+VLLM_SCAN_PORTS = PortKind("vllm_scan", VLLM_PORT_BASE, VLLM_PORT_STRIDE, span=VLLM_PORT_STRIDE, bounded=False)
 # vLLM discovery-connector (MoRI-IO) workers: one port per local rank in each block.
 MORIIO_HANDSHAKE_PORTS = PortKind("moriio_handshake", VLLM_MORIIO_HANDSHAKE_PORT_BASE)
 MORIIO_NOTIFY_PORTS = PortKind("moriio_notify", VLLM_MORIIO_NOTIFY_PORT_BASE)

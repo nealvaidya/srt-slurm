@@ -1,0 +1,31 @@
+# Aggregate job with coordinated ports; replace the model and image for your cluster.
+schema: 2
+name: job-port-isolation
+job_scoped_ports: true
+model:
+  path: /models/model
+  container: /images/dynamo-vllm.sqsh
+  precision: bf16
+resources:
+  gpus_per_node: 8
+engine:
+  type: vllm
+  connector:
+frontend:
+  type: dynamo
+roles:
+  agg:
+    nodes: 1
+    workers: 1
+    gpus: 1
+services:
+  - name: host-metrics
+    type: node-exporter
+    start: before_workers
+    placement:
+      node: compute
+benchmark:
+  type: manual
+observability:
+  tachometer:
+    enabled: false

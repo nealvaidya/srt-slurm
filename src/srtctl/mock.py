@@ -232,7 +232,7 @@ def mock_infrastructure(*, options: MockOptions, output_dir: Path):
         return FakePopen(
             cmd=cmd,
             output=kwargs.get("output"),
-            duration_s=options.child_duration_s,
+            duration_s=3600 if str(kwargs.get("step_name", "")).startswith("port_guard_") else options.child_duration_s,
         )
 
     def _fake_wait_for_port(*_args, **_kwargs) -> bool:
@@ -265,6 +265,8 @@ def mock_infrastructure(*, options: MockOptions, output_dir: Path):
     patch_targets: list[tuple[str, Any]] = [
         # srun process starters.
         ("srtctl.core.slurm.start_srun_process", _fake_srun),
+        ("srtctl.core.port_reservation.start_srun_process", _fake_srun),
+        ("srtctl.core.port_reservation.PortLeaseManager._wait", lambda self: None),
         ("srtctl.cli.do_sweep.start_srun_process", _fake_srun),
         ("srtctl.cli.mixins.worker_stage.start_srun_process", _fake_srun),
         ("srtctl.cli.mixins.frontend_stage.start_srun_process", _fake_srun),

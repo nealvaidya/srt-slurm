@@ -72,11 +72,15 @@ class EtcdService(_InfraKind):
     def build_command(self, service: ServiceConfig, ctx: ServiceLaunchContext) -> list[str]:
         if service.command is not None:
             return list(service.effective_command)
-        client_port = runtime_port(ctx.runtime, "etcd-client", ETCD_CLIENT_PORT)
+        client_port = runtime_port(
+            ctx.runtime, "etcd-client", ETCD_CLIENT_PORT, node=ctx.node, owner=f"service:{service.name}"
+        )
         data_dir = _job_path(ctx, ETCD_DATA_DIR)
         peer_args = []
         if getattr(ctx.runtime, "job_ports", None) is not None:
-            peer = runtime_port(ctx.runtime, "etcd-peer", ETCD_PEER_PORT)
+            peer = runtime_port(
+                ctx.runtime, "etcd-peer", ETCD_PEER_PORT, node=ctx.node, owner=f"service:{service.name}"
+            )
             peer_args = [
                 "--listen-peer-urls",
                 f"http://0.0.0.0:{peer}",
@@ -118,7 +122,7 @@ class NatsService(_InfraKind):
         if service.command is not None:
             return list(service.effective_command)
         port_args = (
-            ["-p", str(runtime_port(ctx.runtime, "nats", NATS_PORT))]
+            ["-p", str(runtime_port(ctx.runtime, "nats", NATS_PORT, node=ctx.node, owner=f"service:{service.name}"))]
             if getattr(ctx.runtime, "job_ports", None) is not None
             else []
         )

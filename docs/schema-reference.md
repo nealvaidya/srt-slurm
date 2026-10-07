@@ -15,7 +15,7 @@ Top-level keys of a recipe YAML.
 | `resources` | [ResourceConfig](#resourceconfig) | required |  |
 | `schema` | int | required | Recipe schema version. Every recipe declares `schema: 2`; a recipe without it is the pre-2.0 layout and does not load (see [legacy-v1.md](legacy-v1.md) and `srtctl migrate`). |
 | `slurm` | [SlurmConfig](#slurmconfig) | `SlurmConfig()` |  |
-| `job_scoped_ports` | bool | `False` |  |
+| `job_scoped_ports` | bool | `False` | Coordinate managed aggregate Dynamo/vLLM ports with node-local leases and bounded startup retries. |
 | `engine` | str \| mapping | optional when every role sets `engine` | The engine type (`atom`, `sglang`, `tilert`, `trtllm`, `vllm`, `mocker`) as a string, or a mapping with `type` plus the engine-wide knobs listed under [Engine types](#engine-types). |
 | `roles` | dict[str, [RoleConfig](#roleconfig)] | `{}` | One block per worker role (`prefill`, `decode`, `agg`): nodes, workers, GPUs, env, engine args. |
 | `frontend` | [FrontendConfig](#frontendconfig) | `FrontendConfig()` |  |

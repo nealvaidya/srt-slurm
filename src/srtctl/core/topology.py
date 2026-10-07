@@ -18,7 +18,7 @@ After (Python):
         print(f"{endpoint.mode} worker {endpoint.index} on {endpoint.nodes}")
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -65,6 +65,7 @@ class NodePortAllocator:
 
     bases: dict[str, int] = field(default_factory=dict)
     limits: dict[str, int] = field(default_factory=dict)
+    on_allocate: Callable[[PortKind, str | None, int, int], None] | None = field(default=None, repr=False)
     _next: dict[tuple[str, str | None], int] = field(default_factory=dict, repr=False)
 
     def next(self, kind: PortKind, node: str | None = None, size: int = 1) -> int:
@@ -83,9 +84,15 @@ class NodePortAllocator:
         ordinal = self._next.get(key, 0)
         self._next[key] = ordinal + size
         port = self.bases.get(kind.name, kind.base) + ordinal * kind.stride
-        last = port + (size - 1) * kind.stride
+        last = port + size * kind.stride - 1
         if last >= self.limits.get(kind.name, 65536):
             raise ValueError(f"{kind.name} port range exhausted at {port}..{last}")
+        if self.on_allocate is not None:
+            if kind.stride <= kind.span:
+                self.on_allocate(kind, node, port, (size - 1) * kind.stride + kind.span)
+            else:
+                for offset in range(size):
+                    self.on_allocate(kind, node, port + offset * kind.stride, kind.span)
         return port
 
 

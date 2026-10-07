@@ -1,0 +1,171 @@
+# examples/vllm/job-port-isolation.yaml
+# exit_code: 0
+# srun calls: 11
+
+## port_guard_node-01_13
+cpus_per_task: 1
+nodelist: node-01
+output: <output>/logs/port-reservations/slot-13/node-0.out
+command: |
+    python3 <repo>/src/srtctl/runtime_scripts/port_guard.py --slot 13 --job 4242 --control <output>/logs/port-reservations/slot-13/node-0.control.json --status <output>/logs/port-reservations/slot-13/node-0.status.json
+
+## port_guard_node-02_13
+cpus_per_task: 1
+nodelist: node-02
+output: <output>/logs/port-reservations/slot-13/node-1.out
+command: |
+    python3 <repo>/src/srtctl/runtime_scripts/port_guard.py --slot 13 --job 4242 --control <output>/logs/port-reservations/slot-13/node-1.control.json --status <output>/logs/port-reservations/slot-13/node-1.status.json
+
+## port_guard_node-03_13
+cpus_per_task: 1
+nodelist: node-03
+output: <output>/logs/port-reservations/slot-13/node-2.out
+command: |
+    python3 <repo>/src/srtctl/runtime_scripts/port_guard.py --slot 13 --job 4242 --control <output>/logs/port-reservations/slot-13/node-2.control.json --status <output>/logs/port-reservations/slot-13/node-2.status.json
+
+## service_etcd
+nodelist: node-01
+output: <output>/logs/service_etcd.out
+container_image: <container>
+container_mounts:
+    <repo>/src/srtctl/benchmarks/scripts: /srtctl-benchmarks
+    <repo>/src/srtctl/runtime_scripts: /srtctl-runtime
+    <model>: /model
+    <output>/logs: /logs
+use_bash_wrapper: True
+bash_preamble: |
+    rm -rf /tmp/srtctl-4242/etcd && mkdir -p /tmp/srtctl-4242/etcd
+command: |
+    /configs/etcd --data-dir /tmp/srtctl-4242/etcd --listen-client-urls http://0.0.0.0:11568 --advertise-client-urls http://127.0.0.1:11568 --listen-peer-urls http://0.0.0.0:11569 --initial-advertise-peer-urls http://127.0.0.1:11569 --initial-cluster default=http://127.0.0.1:11569
+
+## service_host-metrics_node-01
+nodelist: node-01
+output: <output>/logs/service_host-metrics_node-01.out
+container_image: quay.io#prometheus/node-exporter:v1.8.2
+container_mounts:
+    <repo>/src/srtctl/benchmarks/scripts: /srtctl-benchmarks
+    <repo>/src/srtctl/runtime_scripts: /srtctl-runtime
+    <model>: /model
+    <output>/logs: /logs
+srun_export_env:
+    ETCD_ENDPOINTS: http://127.0.0.1:11568
+use_bash_wrapper: False
+command: |
+    /bin/node_exporter --web.listen-address=:11576 --collector.disable-defaults --collector.cpu --collector.infiniband --collector.meminfo --collector.processes --collector.stat --collector.vmstat --collector.pressure --collector.meminfo_numa '--collector.vmstat.fields=^(oom_kill|pgpg|pswp|pgsteal|pg.*fault).*'
+
+## service_host-metrics_node-02
+nodelist: node-02
+output: <output>/logs/service_host-metrics_node-02.out
+container_image: quay.io#prometheus/node-exporter:v1.8.2
+container_mounts:
+    <repo>/src/srtctl/benchmarks/scripts: /srtctl-benchmarks
+    <repo>/src/srtctl/runtime_scripts: /srtctl-runtime
+    <model>: /model
+    <output>/logs: /logs
+srun_export_env:
+    ETCD_ENDPOINTS: http://127.0.0.1:11568
+use_bash_wrapper: False
+command: |
+    /bin/node_exporter --web.listen-address=:11576 --collector.disable-defaults --collector.cpu --collector.infiniband --collector.meminfo --collector.processes --collector.stat --collector.vmstat --collector.pressure --collector.meminfo_numa '--collector.vmstat.fields=^(oom_kill|pgpg|pswp|pgsteal|pg.*fault).*'
+
+## service_host-metrics_node-03
+nodelist: node-03
+output: <output>/logs/service_host-metrics_node-03.out
+container_image: quay.io#prometheus/node-exporter:v1.8.2
+container_mounts:
+    <repo>/src/srtctl/benchmarks/scripts: /srtctl-benchmarks
+    <repo>/src/srtctl/runtime_scripts: /srtctl-runtime
+    <model>: /model
+    <output>/logs: /logs
+srun_export_env:
+    ETCD_ENDPOINTS: http://127.0.0.1:11568
+use_bash_wrapper: False
+command: |
+    /bin/node_exporter --web.listen-address=:11576 --collector.disable-defaults --collector.cpu --collector.infiniband --collector.meminfo --collector.processes --collector.stat --collector.vmstat --collector.pressure --collector.meminfo_numa '--collector.vmstat.fields=^(oom_kill|pgpg|pswp|pgsteal|pg.*fault).*'
+
+## agg_0_node-01
+nodelist: node-01
+output: <output>/logs/node-01_agg_w0.out
+container_image: <container>
+container_mounts:
+    <repo>/src/srtctl/benchmarks/scripts: /srtctl-benchmarks
+    <repo>/src/srtctl/runtime_scripts: /srtctl-runtime
+    <model>: /model
+    <output>/logs: /logs
+env_to_set:
+    DYN_LOG: info,dynamo_runtime::pipeline::network::ingress::push_handler=warn
+    DYN_REQUEST_PLANE: tcp
+    DYN_SKIP_SGLANG_LOG_FORMATTING: 1
+    DYN_SYSTEM_PORT: 12832
+    DYN_VLLM_KV_EVENT_PORT: 23072
+    ETCD_ENDPOINTS: http://127.0.0.1:11568
+    HEAD_NODE_IP: 127.0.0.1
+    VLLM_NIXL_SIDE_CHANNEL_HOST: 127.0.0.1
+    VLLM_NIXL_SIDE_CHANNEL_PORT: 24096
+    VLLM_PORT: 36064
+srun_export_env:
+    ENROOT_REMAP_ROOT: yes
+bash_preamble: |
+    DYN_LOCK_DIR="$(python3 -c 'import sys; print(sys.prefix)' 2>/dev/null || echo "${HOME:-/root}")" && ( flock -x 200; if [ -f "$DYN_LOCK_DIR/.srtctl_dynamo_install.complete" ]; then echo 'dynamo install already completed in this environment, skipping'; else { echo 'Installing dynamo 0.8.0...' && pip install --break-system-packages --quiet --extra-index-url https://pypi.nvidia.com ai-dynamo-runtime==0.8.0 ai-dynamo==0.8.0 && echo 'Dynamo 0.8.0 installed' ; } && touch "$DYN_LOCK_DIR/.srtctl_dynamo_install.complete"; fi ) 200>"$DYN_LOCK_DIR/.srtctl_dynamo_install.lock" && ( python3 <(cat <<'__FINGERPRINT_EOF__'
+    <fingerprint script>
+    __FINGERPRINT_EOF__
+    ) || true )
+command: |
+    python3 -m dynamo.vllm --model /model --served-model-name model --device-ids 0 --request-plane tcp --dump-config-to /logs/node-01_config.json
+
+## nginx
+nodelist: node-01
+output: <output>/logs/node-01_nginx.out
+container_image: nginx:1.27.4
+container_mounts:
+    <repo>/src/srtctl/benchmarks/scripts: /srtctl-benchmarks
+    <repo>/src/srtctl/runtime_scripts: /srtctl-runtime
+    <model>: /model
+    <output>/logs: /logs
+srun_options:
+    container-remap-root:
+use_bash_wrapper: False
+command: |
+    bash -c 'nginx -c /logs/nginx.conf -g '"'"'daemon off;'"'"''
+
+## frontend_0
+nodelist: node-02
+output: <output>/logs/node-02_frontend_0.out
+container_image: <container>
+container_mounts:
+    <repo>/src/srtctl/benchmarks/scripts: /srtctl-benchmarks
+    <repo>/src/srtctl/runtime_scripts: /srtctl-runtime
+    <model>: /model
+    <output>/logs: /logs
+env_to_set:
+    DYN_REQUEST_PLANE: tcp
+    DYN_SKIP_SGLANG_LOG_FORMATTING: 1
+    ETCD_ENDPOINTS: http://127.0.0.1:11568
+srun_export_env:
+    ENROOT_REMAP_ROOT: yes
+mpi: pmix
+bash_preamble: |
+    DYN_LOCK_DIR="$(python3 -c 'import sys; print(sys.prefix)' 2>/dev/null || echo "${HOME:-/root}")" && ( flock -x 200; if [ -f "$DYN_LOCK_DIR/.srtctl_dynamo_install.complete" ]; then echo 'dynamo install already completed in this environment, skipping'; else { echo 'Installing dynamo 0.8.0...' && pip install --break-system-packages --quiet --extra-index-url https://pypi.nvidia.com ai-dynamo-runtime==0.8.0 ai-dynamo==0.8.0 && echo 'Dynamo 0.8.0 installed' ; } && touch "$DYN_LOCK_DIR/.srtctl_dynamo_install.complete"; fi ) 200>"$DYN_LOCK_DIR/.srtctl_dynamo_install.lock"
+command: |
+    python3 -m dynamo.frontend --http-port=11572
+
+## frontend_1
+nodelist: node-03
+output: <output>/logs/node-03_frontend_1.out
+container_image: <container>
+container_mounts:
+    <repo>/src/srtctl/benchmarks/scripts: /srtctl-benchmarks
+    <repo>/src/srtctl/runtime_scripts: /srtctl-runtime
+    <model>: /model
+    <output>/logs: /logs
+env_to_set:
+    DYN_REQUEST_PLANE: tcp
+    DYN_SKIP_SGLANG_LOG_FORMATTING: 1
+    ETCD_ENDPOINTS: http://127.0.0.1:11568
+srun_export_env:
+    ENROOT_REMAP_ROOT: yes
+mpi: pmix
+bash_preamble: |
+    DYN_LOCK_DIR="$(python3 -c 'import sys; print(sys.prefix)' 2>/dev/null || echo "${HOME:-/root}")" && ( flock -x 200; if [ -f "$DYN_LOCK_DIR/.srtctl_dynamo_install.complete" ]; then echo 'dynamo install already completed in this environment, skipping'; else { echo 'Installing dynamo 0.8.0...' && pip install --break-system-packages --quiet --extra-index-url https://pypi.nvidia.com ai-dynamo-runtime==0.8.0 ai-dynamo==0.8.0 && echo 'Dynamo 0.8.0 installed' ; } && touch "$DYN_LOCK_DIR/.srtctl_dynamo_install.complete"; fi ) 200>"$DYN_LOCK_DIR/.srtctl_dynamo_install.lock"
+command: |
+    python3 -m dynamo.frontend --http-port=11572

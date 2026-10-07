@@ -29,7 +29,8 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
-from srtctl.services.config import ServiceMetricsConfig
+from srtctl.core.job_ports import runtime_port
+from srtctl.services.config import ServiceMetricsConfig, ServiceReadinessConfig, TcpProbe
 from srtctl.services.registry import ServiceKind, ServiceLaunchContext, register_service
 
 if TYPE_CHECKING:
@@ -177,6 +178,20 @@ class _ExporterKind(ServiceKind):
     option_keys = ("port", "collect_interval_ms")
     default_port: ClassVar[int] = 0
 
+    def _port(self, service: ServiceConfig, ctx: ServiceLaunchContext) -> int:
+        return runtime_port(
+            ctx.runtime,
+            service.name,
+            int(service.options.get("port", self.default_port)),
+            node=ctx.node,
+            owner=f"service:{service.name}",
+        )
+
+    def readiness(self, service: ServiceConfig, ctx: ServiceLaunchContext) -> ServiceReadinessConfig | None:
+        if getattr(ctx.runtime, "job_ports", None) is None or service.command is not None:
+            return None
+        return ServiceReadinessConfig(tcp=TcpProbe(port=self._port(service, ctx)))
+
     def metrics(self, service: ServiceConfig) -> list[ServiceMetricsConfig]:
         """Exporters exist to be scraped: ``options.port`` (or the kind's default) at ``/metrics``."""
         if service.metrics:
@@ -196,7 +211,7 @@ class DcgmExporterService(_ExporterKind):
     def build_command(self, service: ServiceConfig, ctx: ServiceLaunchContext) -> list[str]:
         if service.command is not None:
             return list(service.effective_command)
-        port = int(service.options.get("port", DCGM_EXPORTER_PORT))
+        port = self._port(service, ctx)
         interval = int(service.options.get("collect_interval_ms", 1000))
         return ["dcgm-exporter", f"--collect-interval={interval}", "--address", f":{port}", *service.args]
 
@@ -215,7 +230,7 @@ class NodeExporterService(_ExporterKind):
     def build_command(self, service: ServiceConfig, ctx: ServiceLaunchContext) -> list[str]:
         if service.command is not None:
             return list(service.effective_command)
-        port = int(service.options.get("port", NODE_EXPORTER_PORT))
+        port = self._port(service, ctx)
         return [
             "/bin/node_exporter",
             f"--web.listen-address=:{port}",
@@ -267,7 +282,7 @@ class ProcessExporterService(_ExporterKind):
     def build_command(self, service: ServiceConfig, ctx: ServiceLaunchContext) -> list[str]:
         if service.command is not None:
             return list(service.effective_command)
-        port = int(service.options.get("port", PROCESS_EXPORTER_PORT))
+        port = self._port(service, ctx)
         if self.host_native(service):
             configured = self._binary(service)
             executable = str(resolve_host_binary(configured) or Path(configured))

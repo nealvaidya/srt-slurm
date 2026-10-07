@@ -1031,6 +1031,7 @@ class TestRequiredReadinessGate:
 
     def _orchestrator(self, tmp_path, *, required, ready):
         config = MagicMock()
+        config.job_scoped_ports = False
         config.telemetry.enabled = True
         config.telemetry.required = required
         config.telemetry.cpu_power_exporter = None

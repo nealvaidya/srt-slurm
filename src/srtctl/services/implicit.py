@@ -246,7 +246,7 @@ def effective_services(config: SrtConfig, runtime: RuntimeContext | None = None)
         for index, entry in enumerate(effective):
             if entry.service.type in ("dcgm-exporter", "node-exporter", "process-exporter"):
                 service = replace(
-                    entry.service, options={**entry.service.options, "port": plan.fixed(entry.service.type)}
+                    entry.service, options={**entry.service.options, "port": plan.fixed(entry.service.name)}
                 )
                 effective[index] = replace(entry, service=service)
     return effective

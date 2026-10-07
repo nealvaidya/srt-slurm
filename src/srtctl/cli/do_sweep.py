@@ -21,8 +21,7 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from srtctl.backends.vllm import MOONCAKE_STORE_CONFIG_FILENAME, VLLMProtocol
@@ -36,8 +35,9 @@ from srtctl.cli.mixins import (
 )
 from srtctl.core.config import load_config
 from srtctl.core.health import wait_for_port
-from srtctl.core.job_ports import JobPortPlan
+from srtctl.core.job_ports import JobPortPlan, PortConflict
 from srtctl.core.lockfile import write_lockfile
+from srtctl.core.port_reservation import PortLeaseManager
 from srtctl.core.processes import (
     ProcessRegistry,
     setup_signal_handlers,
@@ -79,6 +79,7 @@ class SweepOrchestrator(
     config: SrtConfig
     runtime: RuntimeContext
     serve_only: bool = False
+    port_leases: PortLeaseManager | None = field(default=None, init=False, repr=False)
 
     @property
     def backend(self):
@@ -124,6 +125,35 @@ class SweepOrchestrator(
         else:
             allocator = NodePortAllocator(bases={SIDECAR_GRPC_PORTS.name: self.config.dynamo.sidecar_port})
         return self.config.worker_processes(self.endpoints, port_allocator=allocator)
+
+    def _reserve_job_ports(self, registry: ProcessRegistry, stop_event: threading.Event | None = None) -> None:
+        if not self.config.job_scoped_ports:
+            return
+        failures = []
+        for plan in JobPortPlan.candidates(self.runtime.job_id):
+            if stop_event is not None and stop_event.is_set():
+                raise InterruptedError("Job port allocation interrupted")
+            self.runtime = replace(self.runtime, job_ports=plan, frontend_port=plan.fixed("frontend"))
+            self.__dict__.pop("backend_processes", None)
+            # Existing topology allocation calls describe the managed worker blocks.
+            _ = self.backend_processes
+            topology = self._compute_frontend_topology()
+            frontend_name = "frontend-internal" if topology.uses_nginx else "frontend"
+            for node in topology.frontend_nodes:
+                plan.request(frontend_name, node, owner="frontend")
+            if topology.nginx_node is not None:
+                plan.request("frontend", topology.nginx_node, owner="frontend")
+            manager = PortLeaseManager(self.runtime)
+            try:
+                manager.acquire(registry)
+            except PortConflict as exc:
+                failures.append(str(exc))
+                logger.warning("Skipping occupied job port allocation: %s", exc)
+                continue
+            self.port_leases = manager
+            logger.info("Selected job port slot %s on %s", plan.slot, manager.nodes)
+            return
+        raise PortConflict("No available job port slot: " + "; ".join(failures))
 
     def start_head_infrastructure(self, registry: ProcessRegistry) -> None:
         """Start the discovery plane (etcd, NATS) as services.
@@ -645,6 +675,8 @@ class SweepOrchestrator(
             log_streamer.start()
 
         try:
+            self._reserve_job_ports(registry, stop_event)
+
             # Stage 0: Bare-host node setup (GPU clocks, kernel modules). Runs
             # before anything containerized so workers see the prepared node.
             self._run_host_setup()
@@ -758,6 +790,8 @@ class SweepOrchestrator(
             exit_code = self.finalize_cpu_power_host_telemetry(exit_code, interrupted=stop_event.is_set())
             stop_event.set()
             registry.cleanup()
+            if self.port_leases is not None:
+                self.port_leases.close()
             # Required service artifacts are finalized only after worker drain.
             from srtctl.services.implicit import effective_services
             from srtctl.services.registry import get_service_kind
@@ -835,11 +869,9 @@ def main():
 
         # Type narrowing: job_id is str after the check above
         assert job_id is not None
-        lease = JobPortPlan.from_job_id(job_id).lease(job_id) if config.job_scoped_ports else nullcontext()
-        with lease:
-            runtime = RuntimeContext.from_config(config, job_id)
-            orchestrator = SweepOrchestrator(config=config, runtime=runtime, serve_only=args.serve_only)
-            exit_code = orchestrator.run()
+        runtime = RuntimeContext.from_config(config, job_id)
+        orchestrator = SweepOrchestrator(config=config, runtime=runtime, serve_only=args.serve_only)
+        exit_code = orchestrator.run()
 
         sys.exit(exit_code)
 

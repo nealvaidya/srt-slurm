@@ -94,33 +94,22 @@ def test_slot_lease_rejects_nonprivate_directory(tmp_path):
         pass
 
 
-def test_cli_holds_slot_until_orchestrator_returns(tmp_path):
+def test_cli_uses_one_runtime_and_delegates_reservation_to_orchestrator(tmp_path):
     from srtctl.cli.do_sweep import main
 
     config_path = tmp_path / "recipe.yaml"
     config_path.touch()
-    plan = JobPortPlan(1)
-    directory = tmp_path / "leases"
+    runtime = Mock()
     config = Mock(job_scoped_ports=True)
-
-    def run():
-        with pytest.raises(RuntimeError, match="already leased"), plan.lease("115", directory=directory):
-            pytest.fail("orchestrator must own the slot through cleanup")
-        return 0
-
     with (
         patch.object(sys, "argv", ["do_sweep", str(config_path)]),
         patch("srtctl.cli.do_sweep.load_config", return_value=config),
         patch("srtctl.cli.do_sweep.get_slurm_job_id", return_value="100"),
-        patch("srtctl.cli.do_sweep.RuntimeContext.from_config"),
-        patch(
-            "srtctl.cli.do_sweep.JobPortPlan.from_job_id",
-            return_value=Mock(lease=lambda job: plan.lease(job, directory=directory)),
-        ),
-        patch("srtctl.cli.do_sweep.SweepOrchestrator", return_value=Mock(run=run)),
+        patch("srtctl.cli.do_sweep.RuntimeContext.from_config", return_value=runtime) as from_config,
+        patch("srtctl.cli.do_sweep.SweepOrchestrator", return_value=Mock(run=lambda: 0)) as orchestrator,
         pytest.raises(SystemExit) as exited,
     ):
         main()
     assert exited.value.code == 0
-    with plan.lease("115", directory=directory):
-        pass
+    from_config.assert_called_once_with(config, "100")
+    orchestrator.assert_called_once_with(config=config, runtime=runtime, serve_only=False)
