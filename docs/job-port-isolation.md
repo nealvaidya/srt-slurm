@@ -26,7 +26,9 @@ arbitrary service commands or engine-internal sockets is maintained.
 
 The selected slot provides 120 service ports (10128–11927 across all slots), separate from worker ranges.
 Job-scoped service allocation replaces the managed exporters' `options.port`.
-Their launch arguments, default readiness probes and default metrics annotations
+Managed exporters wait for their own successful-bind log message at the allocated
+port: a competing listener cannot satisfy that gate. Their launch arguments,
+default readiness probes and default metrics annotations
 read the selected allocation. Custom commands, arguments that override bind
 flags, explicit readiness probes and explicit metrics annotations remain the
 recipe's responsibility.

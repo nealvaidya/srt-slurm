@@ -257,7 +257,11 @@ services:
 
     def wait(proc, service, ctx):
         readiness = get_service_kind(service.type).readiness(service, ctx)
-        assert readiness.probe_port == plan.fixed(service.name)
+        from srtctl.core.readiness import run_probe
+
+        log_file = tmp_path / "ready.log"
+        log_file.write_text(f'level=info msg="Listening on" address=[::]:{plan.fixed(service.name)}\n')
+        assert run_probe(readiness.probe, host="127.0.0.1", log_file=log_file)
         if proc.exit_code == 1:
             raise RuntimeError("service exited before readiness")
 
@@ -288,3 +292,30 @@ services:
             with pytest.raises(RuntimeError, match="service exited before readiness"):
                 orchestrator.start_services("after_frontend", ProcessRegistry(job_id="123"))
             assert len(launches) == (4 if failure == "bind-always" else 2)
+
+
+@pytest.mark.parametrize("kind", ["node-exporter", "dcgm-exporter", "process-exporter"])
+def test_exporter_readiness_does_not_accept_a_competing_listener(tmp_path, kind):
+    from srtctl.core.readiness import run_probe
+    from srtctl.services.config import ServiceConfig
+    from srtctl.services.registry import ServiceLaunchContext
+
+    selected = runtime(tmp_path, JobPortPlan(8))
+    service = ServiceConfig(name="host-metrics", type=kind)
+    ctx = ServiceLaunchContext(runtime=selected, node="node0", node_ip="127.0.0.1", node_id=0, index=0, role="workers")
+    # The competing listener really accepts TCP, but it cannot write our log.
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        with patch.object(get_service_kind(kind), "_port", return_value=port):
+            readiness = get_service_kind(kind).readiness(service, ctx)
+        log_file = tmp_path / "service.out"
+        log_file.write_text("starting exporter\n")
+        assert not run_probe(readiness.probe, host="127.0.0.1", log_file=log_file)
+        log_file.write_text(f'level=error msg="listen tcp :{port}: bind: address already in use"\n')
+        assert not run_probe(readiness.probe, host="127.0.0.1", log_file=log_file)
+        log_file.write_text(f'level=info msg="Listening on" address="[::]:{port + 1}"\n')
+        assert not run_probe(readiness.probe, host="127.0.0.1", log_file=log_file)
+        log_file.write_text(f'level=info msg="Listening on" address="[::]:{port}"\n')
+        assert run_probe(readiness.probe, host="127.0.0.1", log_file=log_file)

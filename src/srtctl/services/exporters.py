@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from srtctl.core.job_ports import runtime_port
-from srtctl.services.config import ServiceMetricsConfig, ServiceReadinessConfig, TcpProbe
+from srtctl.services.config import LogProbe, ServiceMetricsConfig, ServiceReadinessConfig
 from srtctl.services.registry import ServiceKind, ServiceLaunchContext, register_service
 
 if TYPE_CHECKING:
@@ -190,7 +190,10 @@ class _ExporterKind(ServiceKind):
     def readiness(self, service: ServiceConfig, ctx: ServiceLaunchContext) -> ServiceReadinessConfig | None:
         if getattr(ctx.runtime, "job_ports", None) is None or service.command is not None:
             return None
-        return ServiceReadinessConfig(tcp=TcpProbe(port=self._port(service, ctx)))
+        # Exporter-toolkit logs this after binding. A TCP probe could instead
+        # connect to a competing listener before our srun child even starts.
+        port = self._port(service, ctx)
+        return ServiceReadinessConfig(log=LogProbe(pattern=rf'Listening on[^\n]*address="?[^\s"]*:{port}(?:"|\s|$)'))
 
     def metrics(self, service: ServiceConfig) -> list[ServiceMetricsConfig]:
         """Exporters exist to be scraped: ``options.port`` (or the kind's default) at ``/metrics``."""
