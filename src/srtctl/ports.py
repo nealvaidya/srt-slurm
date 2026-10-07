@@ -85,6 +85,20 @@ DYNAMO_SIDECAR_GRPC_PORT = 50051
 
 
 @dataclass(frozen=True)
+class PortBlock:
+    """Allocator-owned slots; indexing resolves a rank within the reserved footprint."""
+
+    base: int
+    size: int
+    stride: int = 1
+
+    def __getitem__(self, rank_offset: int) -> int:
+        if not 0 <= rank_offset < self.size:
+            raise IndexError(f"port block rank {rank_offset} outside 0..{self.size - 1}")
+        return self.base + rank_offset * self.stride
+
+
+@dataclass(frozen=True)
 class PortKind:
     """One kind of listener a worker process binds, allocated by ``NodePortAllocator``.
 

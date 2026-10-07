@@ -19,38 +19,27 @@ from srtctl.services.registry import ServiceKind, register_service
 
 
 def publisher_sources(config, processes, runtime, metadata):
-    """Use the actual allocated publisher block, including local DP ranks."""
+    """Subscribe to backend-resolved bindings without inferring the DP topology."""
     backend = config.backend
     sources = []
     for process in sorted(processes, key=lambda p: (p.endpoint_mode, p.endpoint_index, p.node_rank, p.node)):
         if process.engine_id:
             continue
-        dp_size = backend._get_dp_size(process.endpoint_mode) or 1
-        if dp_size <= 1 and not process.is_leader:
-            continue
-        local_dp = 1
-        if dp_size > 1 and backend.dp_launch_mode == "per_node":
-            replica = backend._gpus_per_dp_rank(process.endpoint_mode)
-            if replica > len(process.gpu_indices):
-                raise ValueError("KV recording with cross-node DP replicas is not supported")
-            local_dp = len(process.gpu_indices) // replica
-        if process.kv_events_port is None:
-            raise ValueError("KV-event publisher has no allocated port")
-        host = get_hostname_ip(process.node, runtime.network_interface)
-        for local_rank in range(local_dp):
-            rank = process.node_rank + local_rank if dp_size > 1 else 0
+        for publisher in backend.kv_event_publishers(process):
+            rank = publisher.dp_rank
+            host = get_hostname_ip(publisher.node, runtime.network_interface)
             sources.append(
                 {
-                    "name": f"vllm_{process.endpoint_mode}{process.endpoint_index}_rank{rank}_{process.node}",
+                    "name": f"vllm_{process.endpoint_mode}{process.endpoint_index}_rank{rank}_{publisher.node}",
                     "transport": "zmq",
                     "codec": "vllm_kv_events_v1",
-                    "endpoint": f"tcp://{host}:{process.kv_events_listener(local_rank)}",
+                    "endpoint": f"tcp://{host}:{publisher.port}",
                     "topic": (backend.get_kv_events_config_for_mode(process.endpoint_mode) or {}).get(
                         "topic", "kv-events"
                     ),
                     "metadata": {
                         **metadata,
-                        "hostname": process.node,
+                        "hostname": publisher.node,
                         "job_id": runtime.job_id,
                         "run_name": runtime.run_name,
                         "worker_index": str(process.endpoint_index),

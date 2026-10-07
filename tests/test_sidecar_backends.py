@@ -164,7 +164,7 @@ def test_vllm_sidecar_exposes_each_nodes_hybrid_dp_range(dp_size: int) -> None:
         assert f"python3 -m dynamo.vllm.sidecar --grpc-endpoint 127.0.0.1:{50051 + i}" in script
         assert 'wait -n "${ENGINE_PID}" "${SIDECAR_PID}"' in script
         kv_config = json.loads(engine[engine.index("--kv-events-config") + 1])
-        assert kv_config["endpoint"] == f"tcp://{node_ips[process.node]}:{process.kv_events_port}"
+        assert kv_config["endpoint"] == f"tcp://{node_ips[process.node]}:{processes[0].kv_events_port}"
 
 
 @pytest.mark.parametrize("override", [{"grpc": True}, {"data_parallel_external_lb": True}, {"api-server-count": 0}])

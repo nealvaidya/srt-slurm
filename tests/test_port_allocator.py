@@ -62,6 +62,15 @@ class TestNodePortAllocator:
         assert allocator.next(KV_EVENTS_PORTS, size=2) == KV_EVENTS_PORTS.base
         assert allocator.next(KV_EVENTS_PORTS) == KV_EVENTS_PORTS.base + 2
 
+    def test_rank_access_cannot_escape_a_reserved_block(self):
+        allocator = NodePortAllocator()
+        block = allocator.block(KV_EVENTS_PORTS, size=4)
+        assert [block[rank] for rank in range(4)] == list(range(KV_EVENTS_PORTS.base, KV_EVENTS_PORTS.base + 4))
+        assert allocator.next(KV_EVENTS_PORTS) == KV_EVENTS_PORTS.base + 4
+        for rank in (-1, 4):
+            with pytest.raises(IndexError, match="outside"):
+                block[rank]
+
     def test_per_node_kinds_need_a_node(self):
         with pytest.raises(ValueError, match="allocated per node"):
             NodePortAllocator().next(HTTP_PORTS)

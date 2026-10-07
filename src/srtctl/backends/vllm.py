@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from srtctl.backends.base import SrunConfig
     from srtctl.core.runtime import RuntimeContext
     from srtctl.core.schema import DynamoConfig, ProfilingConfig
-    from srtctl.core.topology import Endpoint, NodePortAllocator, Process
+    from srtctl.core.topology import Endpoint, KVEventPublisher, NodePortAllocator, Process
 
 # Type alias for worker modes
 WorkerMode = Literal["prefill", "decode", "agg"]
@@ -536,7 +536,7 @@ class VLLMProtocol:
 
         env: dict[str, str] = {}
         if process.kv_events_port is not None:
-            env["DYN_VLLM_KV_EVENT_PORT"] = str(process.kv_events_port)
+            env["DYN_VLLM_KV_EVENT_PORT"] = str(self.kv_events_base_port(process))
         row = self.kv_connector_for_mode(process.endpoint_mode)
         discovery = row is not None and row.discovery
         if process.nixl_port is not None and not discovery:
@@ -924,7 +924,39 @@ class VLLMProtocol:
             processes = self._dp_per_node_endpoints_to_processes(endpoints, allocator, sidecar_grpc=dynamo_sidecar)
         else:
             processes = self._dp_per_gpu_endpoints_to_processes(endpoints, allocator, sidecar_grpc=dynamo_sidecar)
-        return [self._with_connector_ports(process, allocator) for process in processes]
+        return [self._with_connector_ports(self._with_kv_events_plan(process), allocator) for process in processes]
+
+    def _with_kv_events_plan(self, process: Process) -> Process:
+        """Finish non-DP plans; DP topology builders already resolve their rank bindings."""
+        from srtctl.core.topology import KVEventPublisher, KVEventsPlan
+
+        if process.kv_events_plan is not None or process.kv_events_port is None:
+            return process
+        if self._is_dp_mode(process.endpoint_mode):
+            # Launch paths without a resolved DP layout retain the legacy base.
+            # KV recording requires resolved bindings (cross-node TP/PP is unsupported).
+            plan = KVEventsPlan.from_listener(process.kv_events_port, rank_offset=process.node_rank)
+        else:
+            publishers = (KVEventPublisher(process.node, process.kv_events_port, 0),) if process.is_leader else ()
+            plan = KVEventsPlan(base_port=process.kv_events_port, publishers=publishers)
+        return replace(process, kv_events_plan=plan)
+
+    def kv_event_publishers(self, process: Process) -> tuple[KVEventPublisher, ...]:
+        """The resolved listeners for recording; never reconstruct rank topology here."""
+        if process.kv_events_plan is None:
+            raise ValueError("KV-event publisher has no allocated plan")
+        if self._is_dp_mode(process.endpoint_mode) and not process.kv_events_plan.publishers:
+            raise ValueError("KV recording with cross-node DP replicas is not supported")
+        return process.kv_events_plan.publishers
+
+    def kv_events_base_port(self, process: Process) -> int:
+        """The publisher configuration base, distinct from the first actual listener."""
+        if process.kv_events_plan is not None:
+            return process.kv_events_plan.base_port
+        # Hand-built single-rank Process objects retain their ordinary port.
+        if process.kv_events_port is None:
+            raise ValueError("KV-event publisher has no allocated port")
+        return process.kv_events_port
 
     def _with_connector_ports(self, process: Process, allocator: NodePortAllocator) -> Process:
         """Allocate the per-process listeners the mode's KV connector needs.
@@ -954,7 +986,7 @@ class VLLMProtocol:
         sidecar_grpc: bool,
     ) -> list[Process]:
         """DP+EP mode with one process per DP rank (TP x PP GPUs each)."""
-        from srtctl.core.topology import Process
+        from srtctl.core.topology import KVEventPublisher, KVEventsPlan, Process
 
         processes: list[Process] = []
         for endpoint in endpoints:
@@ -994,6 +1026,7 @@ class VLLMProtocol:
             # vLLM computes actual_port = base + data_parallel_rank, so every DP
             # rank of the endpoint shares one reserved block.
             nixl_base_port = allocator.next(NIXL_PORTS, size=dp_size)
+            kv_events_block = allocator.block(KV_EVENTS_PORTS, size=dp_size)
             for node in endpoint.nodes:
                 for rank_gpus in rank_gpu_groups:
                     is_leader = dp_rank == 0
@@ -1011,7 +1044,11 @@ class VLLMProtocol:
                                 if endpoint.mode == "prefill" and is_leader
                                 else None
                             ),
-                            kv_events_port=allocator.next(KV_EVENTS_PORTS),
+                            kv_events_port=kv_events_block[dp_rank],
+                            kv_events_plan=KVEventsPlan(
+                                base_port=kv_events_block.base,
+                                publishers=(KVEventPublisher(node, kv_events_block[dp_rank], dp_rank),),
+                            ),
                             nixl_port=nixl_base_port,
                             dp_rpc_port=dp_rpc_port,
                             kvbm_zmq_port=allocator.next(KVBM_ZMQ_PORTS),
@@ -1034,7 +1071,7 @@ class VLLMProtocol:
         ``--data-parallel-size-local`` is GPUs-on-node / (TP x PP x PCP), not the GPU
         count. Start ranks advance by that local DP size.
         """
-        from srtctl.core.topology import Process, endpoints_to_processes
+        from srtctl.core.topology import KVEventPublisher, KVEventsPlan, Process, endpoints_to_processes
 
         processes: list[Process] = []
         for endpoint in endpoints:
@@ -1076,6 +1113,7 @@ class VLLMProtocol:
             local_dp_size = self._get_local_dp_size(endpoint.mode, local_gpu_count)
             dp_rpc_port = allocator.next(DP_RPC_PORTS, endpoint.leader_node)
             nixl_base_port = allocator.next(NIXL_PORTS, size=dp_size)
+            kv_events_block = allocator.block(KV_EVENTS_PORTS, size=dp_size)
             dp_start_rank = 0
 
             for node in endpoint.nodes:
@@ -1089,8 +1127,14 @@ class VLLMProtocol:
                         endpoint_index=endpoint.index,
                         node_rank=dp_start_rank,
                         bootstrap_port=(allocator.next(BOOTSTRAP_PORTS, node) if endpoint.mode == "prefill" else None),
-                        # One KV-event publisher per local DP rank: reserve the block.
-                        kv_events_port=allocator.next(KV_EVENTS_PORTS, size=local_dp_size),
+                        kv_events_port=kv_events_block[dp_start_rank],
+                        kv_events_plan=KVEventsPlan(
+                            base_port=kv_events_block.base,
+                            publishers=tuple(
+                                KVEventPublisher(node, kv_events_block[rank], rank)
+                                for rank in range(dp_start_rank, dp_start_rank + local_dp_size)
+                            ),
+                        ),
                         nixl_port=nixl_base_port,
                         dp_rpc_port=dp_rpc_port,
                         het_group=endpoint.het_group,
@@ -1451,10 +1495,9 @@ class VLLMProtocol:
 
         kv_cfg = self.get_kv_events_config_for_mode(mode)
         if kv_cfg and process.kv_events_port is not None:
-            # vLLM adds its global DP rank to the publisher endpoint. The
-            # allocator already reserved the actual listener port/block.
-            dp_rank = process.node_rank if self._is_dp_mode(mode) else 0
-            kv_cfg["endpoint"] = f"tcp://*:{process.vllm_kv_events_base(dp_rank)}"
+            # vLLM offsets this shared DP-group base by the global rank.
+            # See vllm-project/vllm v0.27.1, distributed/kv_events.py.
+            kv_cfg["endpoint"] = f"tcp://*:{self.kv_events_base_port(process)}"
             cmd.extend(["--kv-events-config", json.dumps(kv_cfg)])
 
         # Add all config flags from the role's args
@@ -1625,7 +1668,7 @@ class VLLMProtocol:
 
         kv_cfg = self.get_kv_events_config_for_mode(mode)
         if kv_cfg and process.kv_events_port is not None:
-            kv_cfg["endpoint"] = f"tcp://{process_ip}:{process.kv_events_port}"
+            kv_cfg["endpoint"] = f"tcp://{process_ip}:{self.kv_events_base_port(process)}"
             command.extend(["--kv-events-config", json.dumps(kv_cfg)])
 
         command.extend(_config_to_cli_args(config))

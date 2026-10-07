@@ -5,26 +5,27 @@
 import json
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import tomli
 import yaml
 
+from srtctl.core.job_ports import JobPortPlan
 from srtctl.core.schema import SrtConfig
-from srtctl.core.topology import Process
+from srtctl.core.topology import Endpoint, KVEventPublisher, KVEventsPlan, NodePortAllocator, Process
 from srtctl.services.config import ServiceConfig
 from srtctl.services.kv_events import KVEventsService, publisher_sources, recorder_toml
 
 
-def config(dp=1, tp=1):
+def config(dp=1, tp=1, launch_mode="per_node"):
     return SrtConfig.Schema().load(
         yaml.safe_load(f"""
 schema: 2
 name: kv-test
 model: {{path: /model, container: /worker.sqsh, precision: bf16}}
 resources: {{gpu_type: b200, gpus_per_node: 4}}
-engine: vllm
+engine: {{type: vllm, dp_launch_mode: {launch_mode}}}
 roles:
   agg:
     nodes: 1
@@ -48,6 +49,10 @@ def process(rank=0, gpus=4, port=22000):
         endpoint_index=0,
         node_rank=rank,
         kv_events_port=port,
+        kv_events_plan=KVEventsPlan(
+            base_port=port,
+            publishers=(KVEventPublisher("n0", port, 0),) if rank == 0 else (),
+        ),
     )
 
 
@@ -62,8 +67,13 @@ def runtime(tmp_path):
 
 
 def test_local_dp_sources_cover_actual_reserved_listener_ports(tmp_path):
+    cfg = config(dp=4)
+    workers = cfg.backend.endpoints_to_processes(
+        [Endpoint("agg", 0, ("n0",), frozenset(range(4)))],
+        port_allocator=NodePortAllocator(bases={"kv_events": 22000}),
+    )
     with patch("srtctl.services.kv_events.get_hostname_ip", return_value="10.1.2.3"):
-        sources = publisher_sources(config(dp=4), [process()], runtime(tmp_path), {"clu_run_id": "run"})
+        sources = publisher_sources(cfg, workers, runtime(tmp_path), {"clu_run_id": "run"})
     assert [s["endpoint"] for s in sources] == [f"tcp://10.1.2.3:{22000 + i}" for i in range(4)]
     assert [s["metadata"]["dp_rank"] for s in sources] == ["0", "1", "2", "3"]
     assert len({s["name"] for s in sources}) == 4
@@ -145,19 +155,55 @@ def test_shutdown_requires_complete_gapless_fleet_and_all_trace_files(tmp_path, 
             KVEventsService().finalize(service, runtime(tmp_path))
 
 
-def test_vllm_global_dp_offset_binds_the_reserved_listener(tmp_path):
-    from unittest.mock import MagicMock
+@pytest.mark.parametrize("launch_mode", ["per_node", "per_gpu"])
+@pytest.mark.parametrize("tp", [1, 2])
+def test_dp_groups_share_a_base_and_reservations_match_commands_and_recorder(tmp_path, launch_mode, tp):
+    cfg = config(dp=4, tp=tp, launch_mode=launch_mode)
+    endpoints = [
+        Endpoint(
+            "agg", index, ("n0", "n1"), frozenset(range(index * 2 * tp, (index + 1) * 2 * tp)), gpus_per_node=4 * tp
+        )
+        for index in range(2)
+    ]
+    plan = JobPortPlan(1)
+    workers = cfg.backend.endpoints_to_processes(endpoints, port_allocator=plan.allocator())
+    reservations = [request for request in plan.requests.values() if request.name.startswith("kv_events:")]
+    assert [request.size for request in reservations] == [4, 4]
+    bases = [request.port for request in reservations]
+    assert bases[1] == bases[0] + 4
 
-    cfg = config(dp=4)
-    leader = process(gpus=2)
-    worker = process(rank=2, gpus=2, port=22002)
+    node_ips = {"n0": "10.1.2.3", "n1": "10.1.2.4"}
     rt = MagicMock(model_path=Path("/model"), is_hf_model=False, frontend_port=9010, job_id="12345", run_name="kv-test")
-    with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.1.2.3"):
-        command = cfg.backend.build_worker_command(worker, [leader, worker], rt)
-    publisher = json.loads(command[command.index("--kv-events-config") + 1])
-    assert publisher["endpoint"] == "tcp://*:22000"
-    # vLLM adds rank 2 back, landing at the listener the recorder subscribes to.
-    assert int(publisher["endpoint"].rsplit(":", 1)[1]) + worker.node_rank == worker.kv_events_listener()
+    expected = []
+    with patch("srtctl.core.slurm.get_hostname_ip", side_effect=lambda node, *_: node_ips[node]):
+        for worker in workers:
+            group = [p for p in workers if p.endpoint_index == worker.endpoint_index]
+            command = cfg.backend.build_worker_command(worker, group, rt)
+            publisher = json.loads(command[command.index("--kv-events-config") + 1])
+            base = bases[worker.endpoint_index]
+            assert publisher["endpoint"] == f"tcp://*:{base}"
+            assert cfg.backend.get_process_environment(worker)["DYN_VLLM_KV_EVENT_PORT"] == str(base)
+            assert worker.kv_events_plan.publishers[0].dp_rank == worker.node_rank
+            for binding in cfg.backend.kv_event_publishers(worker):
+                assert binding.port == base + binding.dp_rank
+                assert binding.node == worker.node
+                expected.append((f"tcp://{node_ips[binding.node]}:{binding.port}", str(binding.dp_rank)))
+    with patch("srtctl.services.kv_events.get_hostname_ip", side_effect=lambda node, *_: node_ips[node]):
+        sources = publisher_sources(cfg, workers, runtime(tmp_path), {})
+    assert [(source["endpoint"], source["metadata"]["dp_rank"]) for source in sources] == expected
+    assert len(sources) == 8
+    assert {int(endpoint.rsplit(":", 1)[1]) for endpoint, _ in expected} == {
+        port for request in reservations for port in range(request.port, request.port + request.size)
+    }
+
+
+def test_cross_node_dp_recording_remains_unsupported(tmp_path):
+    cfg = config(dp=2, tp=4)
+    workers = cfg.backend.endpoints_to_processes(
+        [Endpoint("agg", 0, ("n0", "n1", "n2", "n3"), frozenset(range(2)))],
+    )
+    with pytest.raises(ValueError, match="cross-node DP replicas"):
+        publisher_sources(cfg, workers, runtime(tmp_path), {})
 
 
 def test_worker_health_checks_the_job_frontend_port(tmp_path):

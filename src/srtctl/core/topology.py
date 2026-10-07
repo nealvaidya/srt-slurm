@@ -31,6 +31,7 @@ from srtctl.ports import (
     NIXL_PORTS,
     SIDECAR_GRPC_PORTS,
     SYS_PORTS,
+    PortBlock,
     PortKind,
 )
 
@@ -95,6 +96,10 @@ class NodePortAllocator:
                     self.on_allocate(kind, node, port + offset * kind.stride, kind.span)
         return port
 
+    def block(self, kind: PortKind, node: str | None = None, size: int = 1) -> PortBlock:
+        """Reserve slots once and resolve rank offsets inside that allocation."""
+        return PortBlock(self.next(kind, node, size), size, kind.stride)
+
 
 @dataclass(frozen=True)
 class Endpoint:
@@ -150,6 +155,28 @@ class Endpoint:
 
 
 @dataclass(frozen=True)
+class KVEventPublisher:
+    """One resolved publisher listener, attributed to its global DP rank."""
+
+    node: str
+    port: int
+    dp_rank: int
+
+
+@dataclass(frozen=True)
+class KVEventsPlan:
+    """Backend configuration base and the concrete listeners it produces."""
+
+    base_port: int
+    publishers: tuple[KVEventPublisher, ...] = ()
+
+    @classmethod
+    def from_listener(cls, port: int, *, rank_offset: int = 0) -> "KVEventsPlan":
+        """Retain a legacy listener's configuration base without claiming a resolved fleet."""
+        return cls(base_port=port - rank_offset)
+
+
+@dataclass(frozen=True)
 class Process:
     """A physical process within an endpoint.
 
@@ -162,7 +189,8 @@ class Process:
         sys_port: DYN_SYSTEM_PORT for this process
         http_port: HTTP serving port for this process (avoids conflicts on same node)
         bootstrap_port: P/D coordination port (only for prefill leaders)
-        kv_events_port: ZMQ port for kv-events publishing (all worker leaders)
+        kv_events_port: First actual ZMQ publisher listener owned by this process
+        kv_events_plan: Backend configuration base and resolved publisher node/port/rank bindings
         nixl_port: NIXL side channel port for KV transfers (vLLM only)
         endpoint_mode: The mode of the parent endpoint
         endpoint_index: The index of the parent endpoint
@@ -206,21 +234,12 @@ class Process:
     trtllm_dist_init_port: int | None = None
     moriio_handshake_port: int | None = None
     moriio_notify_port: int | None = None
+    kv_events_plan: KVEventsPlan | None = None
 
     @property
     def is_leader(self) -> bool:
         """Whether this is the leader process for the endpoint."""
         return self.node_rank == 0
-
-    def kv_events_listener(self, local_rank: int = 0) -> int:
-        """A listener inside this process's allocator-reserved local DP block."""
-        if self.kv_events_port is None:
-            raise ValueError("KV-event publisher has no allocated port")
-        return self.kv_events_port + local_rank
-
-    def vllm_kv_events_base(self, global_dp_rank: int) -> int:
-        """Undo vLLM's global-rank offset so it binds the allocated listener."""
-        return self.kv_events_listener() - global_dp_rank
 
     @property
     def engine_suffix(self) -> str:

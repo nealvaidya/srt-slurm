@@ -1,0 +1,30 @@
+# Four DP ranks across two nodes. The second node owns global ranks 2 and 3;
+# both launchers receive one shared KV publisher base from the job port plan.
+schema: 2
+name: job-port-isolation-dp
+job_scoped_ports: true
+model:
+  path: /models/model
+  container: /images/dynamo-vllm.sqsh
+  precision: bf16
+resources:
+  gpus_per_node: 4
+engine:
+  type: vllm
+  connector:
+frontend:
+  type: dynamo
+roles:
+  agg:
+    nodes: 2
+    workers: 1
+    gpus: 8
+    args:
+      tensor-parallel-size: 2
+      data-parallel-size: 4
+    kv_events: true
+benchmark:
+  type: manual
+observability:
+  tachometer:
+    enabled: false

@@ -49,6 +49,26 @@ passes. A failed guard step aborts startup; missing Python, permission errors
 and guard timeouts do not trigger a search for another slot. Services that fail
 after startup use the existing process-monitor failure path, not port retries.
 
+## KV-event publisher bindings
+
+The vLLM backend reserves one contiguous KV-event publisher block per DP group.
+All launchers in that group receive the same configuration base; vLLM adds each
+publisher's global DP rank to that base. The backend stores the resulting node,
+port and rank bindings alongside the allocation. The KV recorder reads those
+bindings rather than inferring local rank counts from GPUs or configuration.
+For example, a four-rank group given base 22000 publishes on 22000–22003,
+including ranks 2–3 on a second node. Another colocated group receives a separate
+block. Dynamo worker and sidecar command builders both read the configuration
+base; `Process.kv_events_port` continues to identify the first actual listener
+for that process.
+
+See [the two-node DP example](../examples/features/job-port-isolation-dp.yaml).
+
+This behavior follows [vLLM v0.27.1's publisher rank offsets](https://github.com/vllm-project/vllm/blob/v0.27.1/vllm/distributed/kv_events.py#L456-L483).
+KV recording still requires each DP replica's TP/PP GPUs to fit on one node;
+cross-node TP/PP replicas retain their existing launch convention and are not
+supported by the recorder.
+
 ## Evidence and limits
 
 `logs/port_plan.json` contains the selected slot, job ID, node set, revision,
